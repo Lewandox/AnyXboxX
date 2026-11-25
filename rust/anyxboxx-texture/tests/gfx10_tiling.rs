@@ -306,3 +306,64 @@ fn validates_pipe_configs_and_error_paths() {
     assert!(layout.element_offset(0, 0, 16, 0).is_err());
     assert!(layout.detile_subresource(&vec![0u8; 1024], 0, 0).is_err());
 }
+
+#[test]
+fn fast_copy_matches_element_offset_across_linear_and_tiled_modes() {
+    // Vérifie que le chemin factorisé X/Y/Z de `tile_subresource` / `detile_subresource` produit
+    // exactement les mêmes octets que `element_offset` pour Linear et les modes tuilés 4K/64K/XOR
+    // (avec tableaux, mips standards + queue de mips, et pipeBankXor non nul).
+    let modes = [
+        SwizzleMode::Linear,
+        SwizzleMode::Sw4KS,
+        SwizzleMode::Sw4KSX,
+        SwizzleMode::Sw64KS,
+        SwizzleMode::Sw64KST,
+        SwizzleMode::Sw64KSX,
+        SwizzleMode::Sw64KDX,
+        SwizzleMode::Sw64KRX,
+        SwizzleMode::Sw64KZX,
+    ];
+    for mode in modes {
+        for element_bytes in [1u32, 4, 16] {
+            let desc = SurfaceDesc {
+                width: 140,
+                height: 92,
+                mip_levels: 5,
+                array_size: 2,
+                element_bytes,
+                block_side: 1,
+                swizzle: mode,
+                pipes: PipeConfig::SCARLETT,
+                pipe_bank_xor: 0xC5,
+            };
+            let layout = SurfaceLayout::compute(desc).unwrap();
+            let mut tiled_fast = vec![0u8; layout.total_size as usize];
+            let mut tiled_ref = vec![0u8; layout.total_size as usize];
+            let bpe = element_bytes as usize;
+
+            for slice in 0..desc.array_size {
+                for mip in 0..desc.mip_levels {
+                    let m = layout.mips[mip as usize];
+                    let (w, h) = (m.width_elements as usize, m.height_elements as usize);
+                    let linear: Vec<u8> = (0..w * h * bpe)
+                        .map(|i| ((i as u32 * 31 + slice * 7 + mip * 13) & 0xFF) as u8)
+                        .collect();
+                    layout.tile_subresource(&linear, &mut tiled_fast, mip, slice).unwrap();
+                    for y in 0..m.height_elements {
+                        for x in 0..m.width_elements {
+                            let dst = layout.element_offset(mip, slice, x, y).unwrap();
+                            let src = (y as usize * w + x as usize) * bpe;
+                            tiled_ref[dst..dst + bpe].copy_from_slice(&linear[src..src + bpe]);
+                        }
+                    }
+                    assert_eq!(
+                        layout.detile_subresource(&tiled_fast, mip, slice).unwrap(),
+                        linear,
+                        "detile {mode:?} bpe={element_bytes} slice={slice} mip={mip}"
+                    );
+                }
+            }
+            assert_eq!(tiled_fast, tiled_ref, "tiled backing mismatch {mode:?} bpe={element_bytes}");
+        }
+    }
+}

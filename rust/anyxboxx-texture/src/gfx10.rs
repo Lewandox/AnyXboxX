@@ -309,45 +309,28 @@ impl SurfaceLayout {
 
     /// Désentrelace une sous-ressource `(mip, slice)` vers un tampon linéaire contigu.
     pub fn detile_subresource(&self, tiled: &[u8], mip: u32, slice: u32) -> Result<Vec<u8>, String> {
-        if (tiled.len() as u64) < self.total_size {
-            return Err(format!(
-                "tampon tuilé trop court : {} octets reçus, {} attendus",
-                tiled.len(),
-                self.total_size
-            ));
-        }
-        let m = self.mips.get(mip as usize).ok_or_else(|| format!("mip {mip} hors limites"))?;
-        if slice >= self.desc.array_size {
-            return Err(format!("tranche {slice} hors limites"));
-        }
-        let bpe = self.desc.element_bytes as usize;
-        let (w, h) = (m.width_elements as usize, m.height_elements as usize);
+        let (m, w, h, bpe) = self.validate_subresource(tiled.len(), mip, slice)?;
         let mut linear = vec![0u8; w * h * bpe];
-        for y in 0..m.height_elements {
-            for x in 0..m.width_elements {
-                let src = self.element_offset(mip, slice, x, y)?;
-                let dst = (y as usize * w + x as usize) * bpe;
-                linear[dst..dst + bpe].copy_from_slice(&tiled[src..src + bpe]);
+        if matches!(self.desc.swizzle, SwizzleMode::Linear) {
+            let base = (self.slice_size * u64::from(slice) + m.offset) as usize;
+            let row_stride = m.pitch_elements as usize * bpe;
+            let row_bytes = w * bpe;
+            for y in 0..h {
+                let src = base + y * row_stride;
+                let dst = y * row_bytes;
+                linear[dst..dst + row_bytes].copy_from_slice(&tiled[src..src + row_bytes]);
             }
+            return Ok(linear);
         }
+        self.copy_tiled_subresource(m, slice, w, h, bpe, |tiled_off, linear_off| {
+            linear[linear_off..linear_off + bpe].copy_from_slice(&tiled[tiled_off..tiled_off + bpe]);
+        });
         Ok(linear)
     }
 
     /// Range une sous-ressource linéaire `(mip, slice)` dans le tampon tuilé.
     pub fn tile_subresource(&self, linear: &[u8], tiled: &mut [u8], mip: u32, slice: u32) -> Result<(), String> {
-        if (tiled.len() as u64) < self.total_size {
-            return Err(format!(
-                "tampon tuilé trop court : {} octets reçus, {} attendus",
-                tiled.len(),
-                self.total_size
-            ));
-        }
-        let m = self.mips.get(mip as usize).ok_or_else(|| format!("mip {mip} hors limites"))?;
-        if slice >= self.desc.array_size {
-            return Err(format!("tranche {slice} hors limites"));
-        }
-        let bpe = self.desc.element_bytes as usize;
-        let (w, h) = (m.width_elements as usize, m.height_elements as usize);
+        let (m, w, h, bpe) = self.validate_subresource(tiled.len(), mip, slice)?;
         let expected_linear = w * h * bpe;
         if linear.len() != expected_linear {
             return Err(format!(
@@ -355,13 +338,88 @@ impl SurfaceLayout {
                 linear.len()
             ));
         }
+        if matches!(self.desc.swizzle, SwizzleMode::Linear) {
+            let base = (self.slice_size * u64::from(slice) + m.offset) as usize;
+            let row_stride = m.pitch_elements as usize * bpe;
+            let row_bytes = w * bpe;
+            for y in 0..h {
+                let dst = base + y * row_stride;
+                let src = y * row_bytes;
+                tiled[dst..dst + row_bytes].copy_from_slice(&linear[src..src + row_bytes]);
+            }
+            return Ok(());
+        }
+        self.copy_tiled_subresource(m, slice, w, h, bpe, |tiled_off, linear_off| {
+            tiled[tiled_off..tiled_off + bpe].copy_from_slice(&linear[linear_off..linear_off + bpe]);
+        });
+        Ok(())
+    }
+
+    fn validate_subresource(&self, tiled_len: usize, mip: u32, slice: u32) -> Result<(MipLayout, usize, usize, usize), String> {
+        if (tiled_len as u64) < self.total_size {
+            return Err(format!(
+                "tampon tuilé trop court : {tiled_len} octets reçus, {} attendus",
+                self.total_size
+            ));
+        }
+        let m = *self.mips.get(mip as usize).ok_or_else(|| format!("mip {mip} hors limites"))?;
+        if slice >= self.desc.array_size {
+            return Err(format!("tranche {slice} hors limites"));
+        }
+        Ok((m, m.width_elements as usize, m.height_elements as usize, self.desc.element_bytes as usize))
+    }
+
+    /// Parcourt tous les éléments `(x, y)` d'une sous-ressource tuilée en factorisant les termes X
+    /// (précalculés une fois par colonne) et les termes Y/Z (une fois par ligne).
+    fn copy_tiled_subresource(
+        &self,
+        m: MipLayout,
+        slice: u32,
+        w: usize,
+        h: usize,
+        bpe: usize,
+        mut copy_elem: impl FnMut(usize, usize),
+    ) {
+        let base = (self.slice_size * u64::from(slice) + m.offset) as usize;
+        let block_log2 = self.desc.swizzle.block_log2();
+        let z_xor = self.equation.eval_z(slice) ^ self.effective_xor;
+        let (tail_x, tail_y, in_tail) = match m.tail {
+            Some(t) => (t.x, t.y, true),
+            None => (0, 0, false),
+        };
+        let pitch_blocks = if in_tail { 0 } else { (m.pitch_elements / self.block_width) as usize };
+
+        // Pour les très petits mips (ex. queue de mips), évite l'allocation de la table X.
+        if w * h <= 64 {
+            for y in 0..m.height_elements {
+                let y_blk = if in_tail { 0 } else { ((y / self.block_height) as usize * pitch_blocks) << block_log2 };
+                let y_swiz = self.equation.eval_y(y + tail_y) ^ z_xor;
+                let row_off = y as usize * w * bpe;
+                for x in 0..m.width_elements {
+                    let x_blk = if in_tail { 0 } else { ((x / self.block_width) as usize) << block_log2 };
+                    let tiled_off = base + y_blk + x_blk + (self.equation.eval_x(x + tail_x) ^ y_swiz);
+                    copy_elem(tiled_off, row_off + x as usize * bpe);
+                }
+            }
+            return;
+        }
+
+        let x_table: Vec<(usize, usize)> = (0..m.width_elements)
+            .map(|x| {
+                let x_blk = if in_tail { 0 } else { ((x / self.block_width) as usize) << block_log2 };
+                (x_blk, self.equation.eval_x(x + tail_x))
+            })
+            .collect();
+
         for y in 0..m.height_elements {
-            for x in 0..m.width_elements {
-                let dst = self.element_offset(mip, slice, x, y)?;
-                let src = (y as usize * w + x as usize) * bpe;
-                tiled[dst..dst + bpe].copy_from_slice(&linear[src..src + bpe]);
+            let y_blk = if in_tail { 0 } else { ((y / self.block_height) as usize * pitch_blocks) << block_log2 };
+            let y_swiz = self.equation.eval_y(y + tail_y) ^ z_xor;
+            let row_base = base + y_blk;
+            let mut linear_off = y as usize * w * bpe;
+            for &(x_blk, x_swiz) in &x_table {
+                copy_elem(row_base + x_blk + (x_swiz ^ y_swiz), linear_off);
+                linear_off += bpe;
             }
         }
-        Ok(())
     }
 }

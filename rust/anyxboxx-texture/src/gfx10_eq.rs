@@ -225,12 +225,32 @@ impl Equation {
 
     /// Décalage en octets dans la tuile pour les coordonnées d'élément `(x, y, slice)`.
     pub fn eval_byte_offset(&self, x: u32, y: u32, slice: u32) -> usize {
+        self.eval_x(x) ^ self.eval_y(y) ^ self.eval_z(slice)
+    }
+
+    /// Contribution de l'axe X au décalage intra-tuile (linéaire sur GF(2) : `eval(x, y, z) = eval_x(x) ^ eval_y(y) ^ eval_z(z)`).
+    pub fn eval_x(&self, x: u32) -> usize {
         let mut offset = 0usize;
         for (bit, term) in self.bits.iter().enumerate() {
-            let parity = (x & u32::from(term.x)).count_ones()
-                + (y & u32::from(term.y)).count_ones()
-                + (slice & u32::from(term.z)).count_ones();
-            offset |= ((parity & 1) as usize) << bit;
+            offset |= (((x & u32::from(term.x)).count_ones() & 1) as usize) << bit;
+        }
+        offset
+    }
+
+    /// Contribution de l'axe Y au décalage intra-tuile.
+    pub fn eval_y(&self, y: u32) -> usize {
+        let mut offset = 0usize;
+        for (bit, term) in self.bits.iter().enumerate() {
+            offset |= (((y & u32::from(term.y)).count_ones() & 1) as usize) << bit;
+        }
+        offset
+    }
+
+    /// Contribution de la tranche Z au décalage intra-tuile.
+    pub fn eval_z(&self, slice: u32) -> usize {
+        let mut offset = 0usize;
+        for (bit, term) in self.bits.iter().enumerate() {
+            offset |= (((slice & u32::from(term.z)).count_ones() & 1) as usize) << bit;
         }
         offset
     }
