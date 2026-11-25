@@ -2,7 +2,7 @@
 name = "anyxboxx-audio"
 version = "0.1.0"
 edition = "2021"
-description = "Son console : fichiers XMA2 décodés en WAV par le décodeur xma de TomBox (portage Rust de FFmpeg)."
+description = "Son console : fichiers XMA2 mono/stéréo/multiflux décodés en WAV et voix de lecture continue (décodeur xma de TomBox)."
 license = "GPL-3.0-or-later"
 
 [lib]
