@@ -1,8 +1,13 @@
-//! Textures de la Xbox Series X : blocs BC7, agencement GFX10 en tuiles de 4 Kio, export PNG.
+//! Textures de la Xbox Series X : blocs BC7, agencements GFX10 (4 Kio, 64 Kio, modes XOR,
+//! queues de mips, tableaux 2D), export PNG.
 //!
-//! Le décodage BC7 et le désentrelacement sont portés de Xbox2Windows (R0Y00, licence MIT,
+//! Le décodage BC7 et `SW_4K_S` sont portés de Xbox2Windows (R0Y00, licence MIT,
 //! <https://github.com/R0Y00/Xbox2Windows>, `tools/bc7_blocks.py` et `tools/bc7_tiles.py`).
+//! Les modes GFX10 64 Kio, XOR (`_T`, `_X`), queues de mips et tableaux suivent AMD addrlib
+//! (Mesa, licence MIT).
 pub mod bc7;
+pub mod gfx10;
+mod gfx10_eq;
 pub mod png;
 pub mod tiles;
 
@@ -12,8 +17,11 @@ pub fn decode_surface(blocks: &[u8], width: usize, height: usize) -> Result<Vec<
     const PIXEL_BYTES: usize = 4;
     let (columns, rows) = (width.div_ceil(SIDE), height.div_ceil(SIDE));
     if blocks.len() != columns * rows * bc7::BLOCK_BYTES {
-        return Err(format!("{} octets reçus, {} attendus pour {width}×{height}", blocks.len(),
-                           columns * rows * bc7::BLOCK_BYTES));
+        return Err(format!(
+            "{} octets reçus, {} attendus pour {width}×{height}",
+            blocks.len(),
+            columns * rows * bc7::BLOCK_BYTES
+        ));
     }
     let mut image = vec![0u8; width * height * PIXEL_BYTES];
     if blocks.is_empty() {

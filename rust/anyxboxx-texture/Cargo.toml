@@ -2,7 +2,7 @@
 name = "anyxboxx-texture"
 version = "0.1.0"
 edition = "2021"
-description = "Textures console : décodage BC7, désentrelacement GFX10 SW_4K_S, export PNG (portage de Xbox2Windows, MIT)."
+description = "Textures console : décodage BC7, désentrelacement GFX10 (4 Kio, 64 Kio, XOR, queues de mips, tableaux 2D), export PNG (Xbox2Windows et AMD Mesa addrlib, MIT)."
 license = "GPL-3.0-or-later"
 
 [lib]
