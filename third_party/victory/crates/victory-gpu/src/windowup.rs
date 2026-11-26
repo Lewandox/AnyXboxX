@@ -75,6 +75,8 @@ struct PooledSlab {
     slab: Arc<Slab>,
     /// End of the reserved ranges. A live slab can still append after this point.
     at: u64,
+    /// When a chunk was last handed out from this slab (`crate::host::moment`).
+    last_used: u64,
 }
 
 impl PooledSlab {
@@ -126,7 +128,11 @@ pub(crate) fn alloc(n: u64) -> Option<Chunk> {
         {
             let total = POOLED.fetch_add(SLAB, Ordering::Relaxed) + SLAB;
             PEAK.fetch_max(total, Ordering::Relaxed);
-            pool.slabs.push(PooledSlab { slab, at: 0 });
+            pool.slabs.push(PooledSlab {
+                slab,
+                at: 0,
+                last_used: crate::host::moment(),
+            });
             slot = Some(pool.slabs.len() - 1);
         }
         if let Some(i) = slot {
@@ -136,6 +142,7 @@ pub(crate) fn alloc(n: u64) -> Option<Chunk> {
             slab.live.fetch_add(1, Ordering::Relaxed);
             let offset = entry.at;
             entry.at += n;
+            entry.last_used = crate::host::moment();
             return Some(Chunk { slab, offset });
         }
     }
@@ -152,6 +159,80 @@ pub(crate) fn alloc(n: u64) -> Option<Chunk> {
     OVERFLOW_LIVE.fetch_add(n, Ordering::Relaxed);
     slab.live.fetch_add(1, Ordering::Relaxed);
     Some(Chunk { slab, offset: 0 })
+}
+
+/// Releases idle pooled slabs beyond the single most recently used slab when
+/// they have no live chunks and have sat unused for `idle_ms` and `idle_frames`.
+/// Returns `(slabs_released, bytes_released)`.
+fn trim_idle_with(idle_ms: u64, idle_frames: u64) -> (usize, u64) {
+    let (evicted, bytes) = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.slabs.len() <= 1 {
+            return (0, 0);
+        }
+        // Always retain at least one slab (preferring a live slab, else the
+        // most recently used) so steady-state uploads do not churn D3D12
+        // upload buffer creation.
+        let keep_idx = pool
+            .slabs
+            .iter()
+            .enumerate()
+            .max_by_key(|&(i, s)| {
+                (
+                    s.slab.live.load(Ordering::Acquire) > 0,
+                    s.last_used,
+                    usize::from(i == pool.cur),
+                )
+            })
+            .map_or(0, |(i, _)| i);
+        let cur = pool.cur;
+        let mut evicted: Vec<Arc<Slab>> = Vec::new();
+        let mut kept: Vec<PooledSlab> = Vec::with_capacity(pool.slabs.len());
+        let mut new_cur = 0usize;
+        let mut bytes = 0u64;
+        for (i, entry) in pool.slabs.drain(..).enumerate() {
+            let idle = i != keep_idx
+                && entry.slab.live.load(Ordering::Acquire) == 0
+                && crate::host::long_ago(entry.last_used, idle_ms, idle_frames);
+            if idle {
+                bytes += entry.slab.size;
+                evicted.push(entry.slab);
+            } else {
+                if i == cur {
+                    new_cur = kept.len();
+                }
+                kept.push(entry);
+            }
+        }
+        pool.slabs = kept;
+        pool.cur = new_cur.min(pool.slabs.len().saturating_sub(1));
+        if bytes > 0 {
+            POOLED.fetch_sub(bytes, Ordering::Relaxed);
+        }
+        (evicted, bytes)
+    };
+    let count = evicted.len();
+    drop(evicted);
+    (count, bytes)
+}
+
+/// Lets go of idle surplus slabs in the transient-window upload pool (up to
+/// 512 MiB can accumulate during loading spikes). Called from `host::sweep`.
+pub(crate) fn let_go_idle() {
+    const IDLE_FRAMES: u64 = 4;
+    if POOLED.load(Ordering::Relaxed) <= SLAB {
+        return;
+    }
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let (count, bytes) = trim_idle_with(idle_ms, IDLE_FRAMES);
+    if count > 0 {
+        crate::host::trail(|| {
+            format!(
+                "sweep: {count} idle window upload slabs let go ({} KiB)",
+                bytes >> 10
+            )
+        });
+    }
 }
 
 /// For the ram line: pool bytes now, peak, overflow slabs alive (bytes), overflow allocations so far.

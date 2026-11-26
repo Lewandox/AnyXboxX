@@ -297,6 +297,7 @@ fn sweep() {
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
+    crate::windowup::let_go_idle();
     crate::resource::let_go_idle();
 }
 

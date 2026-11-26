@@ -139,3 +139,49 @@ fn reuses_live_slab_tails() {
         assert_eq!(peak_upload, 2 * SLAB);
     }
 }
+
+#[test]
+fn trim_idle_releases_unused_surplus_slabs_and_keeps_live_ones() {
+    const TRIM_TEST: &str = "windowup::tests::trim_idle_releases_unused_surplus_slabs_and_keeps_live_ones";
+    const TRIM_CHILD: &str = "VICTORY_TEST_WINDOW_UPLOAD_TRIM";
+    if std::env::var_os(TRIM_CHILD).is_none() {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([TRIM_TEST, "--exact", "--nocapture", "--test-threads=1"])
+            .env(TRIM_CHILD, "1")
+            .env("VICTORY_CARD_WINDOW_UPLOAD_MB", "48")
+            .output()
+            .unwrap();
+        print!("{}", String::from_utf8_lossy(&child.stdout));
+        eprint!("{}", String::from_utf8_lossy(&child.stderr));
+        assert!(child.status.success(), "window upload trim test: {}", child.status);
+        return;
+    }
+    if crate::host::host().is_none() {
+        eprintln!("window upload trim test skipped: D3D12 device unavailable");
+        return;
+    }
+    // Allocate three full slabs concurrently.
+    let c1 = alloc(SLAB).expect("slab 1");
+    let c2 = alloc(SLAB).expect("slab 2");
+    let c3 = alloc(SLAB).expect("slab 3");
+    assert_eq!(stats()[0], 3 * SLAB);
+
+    // While all chunks are live, nothing is trimmed.
+    assert_eq!(super::trim_idle_with(0, 0), (0, 0));
+    assert_eq!(stats()[0], 3 * SLAB);
+
+    // Drop two chunks: only the idle surplus slabs are released; the live slab stays.
+    drop(c1);
+    drop(c2);
+    let (count, bytes) = super::trim_idle_with(0, 0);
+    assert_eq!((count, bytes), (2, 2 * SLAB));
+    assert_eq!(stats()[0], SLAB);
+
+    // Once the last chunk drops, the single warm slab is kept and remains reusable.
+    drop(c3);
+    assert_eq!(super::trim_idle_with(0, 0), (0, 0));
+    assert_eq!(stats()[0], SLAB);
+    let reused = alloc(4096).expect("reuse warm slab");
+    assert_eq!(stats()[0], SLAB);
+    drop(reused);
+}
