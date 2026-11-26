@@ -1,7 +1,7 @@
 //! `VICTORY_CLAMP_AFTER_WRITER`: what a list knows of its indirect records (`San`) and the
 //! records the title was seen to read (`learn`). The passes themselves need a card.
 
-use super::{LEARNED, San, WHY, after_writer, learn, min_stride};
+use super::{LEARNED, San, WHY, after_writer, coalesce_ranges, learn, min_stride};
 
 const DRAW: u32 = 0;
 const INDEXED: u32 = 1;
@@ -87,4 +87,14 @@ fn learning_a_record_counts_it_unseen_once() {
     let after = WHY[0].load(std::sync::atomic::Ordering::Relaxed);
     assert!(after > before, "the first sight is counted");
     assert!(LEARNED.lock().unwrap().1.get(&at).is_some_and(|v| v.0 == DRAW));
+}
+
+#[test]
+fn coalesce_ranges_merges_overlapping_and_adjacent_intervals() {
+    assert_eq!(coalesce_ranges(vec![]), vec![]);
+    assert_eq!(coalesce_ranges(vec![(10, 20)]), vec![(10, 20)]);
+    assert_eq!(
+        coalesce_ranges(vec![(30, 40), (10, 20), (20, 25), (15, 31), (50, 60), (55, 58)]),
+        vec![(10, 40), (50, 60)]
+    );
 }

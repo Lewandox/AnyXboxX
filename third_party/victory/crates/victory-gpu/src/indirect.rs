@@ -337,17 +337,15 @@ static LEARNED: std::sync::Mutex<(u64, std::collections::BTreeMap<usize, (u32, u
 
 /// Notes a single record of `kind` the title reads at `at`.
 pub(crate) fn learn(at: usize, kind: u32) {
-    let known = LEARNED.lock().unwrap_or_else(|e| e.into_inner()).1.contains_key(&at);
-    if !known {
-        WHY[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
     let frame = crate::frame::current();
     let mut learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
     if learned.0 != frame {
         learned.0 = frame;
         learned.1.retain(|_, v| v.1 + 2 >= frame);
     }
-    learned.1.insert(at, (kind, frame));
+    if learned.1.insert(at, (kind, frame)).is_none() {
+        WHY[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -379,9 +377,34 @@ impl San {
 
     fn is_clean(&self, at: usize, kind: u32, size: usize) -> bool {
         self.clean.get(&at).is_some_and(|&(k, s)| {
-            k == kind && !self.writes.iter().any(|(&(from, to), &w)| w > s && from < at + size && at < to)
+            k == kind
+                && (s == self.seq
+                    || !self
+                        .writes
+                        .iter()
+                        .any(|(&(from, to), &w)| w > s && from < at + size && at < to))
         })
     }
+}
+
+/// Sorts and merges overlapping or adjacent `[from, to)` ranges into disjoint
+/// intervals so `LEARNED` range queries visit each address at most once.
+fn coalesce_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if ranges.len() <= 1 {
+        return ranges;
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (from, to) in ranges {
+        if from >= to {
+            continue;
+        }
+        match merged.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => merged.push((from, to)),
+        }
+    }
+    merged
 }
 
 const SANITIZE: &str = r#"
@@ -467,27 +490,40 @@ fn pass(list: &HostList, args: &crate::shadow::Shadow, at: u64, kind: u32) -> Re
             .collect();
         (s.seq, ranges)
     });
+    let ranges = coalesce_ranges(ranges);
     // The reader's own record always, and the learned ones in what was written since.
-    let mut records = std::collections::HashMap::new();
+    // Disjoint sorted ranges visit each learned address at most once in ascending order.
+    let target = at as usize;
+    let mut records: Vec<(usize, u32)> = Vec::new();
+    let mut has_target = false;
     {
         let learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
-        for (from, to) in ranges {
+        'ranges: for (from, to) in ranges {
             for (&a, &(k, _)) in learned.1.range(from..to) {
-                if records.len() < MOST {
-                    records.insert(a, k);
+                if a == target {
+                    if !has_target {
+                        records.push((target, kind));
+                        has_target = true;
+                    }
+                } else if records.len() + usize::from(!has_target) < MOST {
+                    records.push((a, k));
+                } else {
+                    break 'ranges;
                 }
             }
         }
     }
-    records.insert(at as usize, kind);
+    if !has_target {
+        records.push((target, kind));
+    }
     let mut table: Vec<[u32; 2]> = Vec::with_capacity(records.len());
     let mut taken: Vec<(usize, u32)> = Vec::with_capacity(records.len());
-    for (&a, &k) in &records {
+    for (a, k) in records {
         let size = min_stride(k).ok_or(2usize)?;
         let off = args.offset(a as u64);
         if a < lo || a + size as usize > hi || !off.is_multiple_of(4) || off + u64::from(size) > u64::from(u32::MAX) {
             // The reader's own record must pass; a learned one may just stay unclean.
-            if a == at as usize {
+            if a == target {
                 return Err(2);
             }
             continue;
