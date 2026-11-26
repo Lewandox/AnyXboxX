@@ -37,23 +37,32 @@ impl BuildHasher for IntBuildHasher {
     }
 }
 
+#[inline]
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    x ^ (x >> 33)
+}
+
 impl Hasher for IntHasher {
     fn finish(&self) -> u64 {
-        self.0
+        mix64(self.0)
     }
 
     fn write(&mut self, bytes: &[u8]) {
         for &b in bytes {
-            self.0 = self.0.wrapping_mul(0x517c_c1b7_2722_0a95) ^ u64::from(b);
+            self.0 = self.0.rotate_left(5).wrapping_mul(0x517c_c1b7_2722_0a95) ^ u64::from(b);
         }
     }
 
     fn write_u32(&mut self, i: u32) {
-        self.0 = (self.0 ^ u64::from(i)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        self.0 = (self.0.rotate_left(5) ^ u64::from(i)).wrapping_mul(0x517c_c1b7_2722_0a95);
     }
 
     fn write_usize(&mut self, i: usize) {
-        self.0 = (self.0 ^ (i as u64)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        self.0 = (self.0.rotate_left(5) ^ (i as u64)).wrapping_mul(0x517c_c1b7_2722_0a95);
     }
 }
 
@@ -328,7 +337,7 @@ impl<C: Clone> Picked<C> {
         if let Some(old) = self.slots.get_mut(&slot)
             && old.copy == key
         {
-            let (old_from, old_to, old_record) = (old.from, old.to, old.record);
+            let (old_from, old_to) = (old.from, old.to);
             old.from = from;
             old.to = to;
             old.record = record;
@@ -339,9 +348,10 @@ impl<C: Clone> Picked<C> {
                 c.from = c.from.min(from);
                 c.to = c.to.max(to);
             }
-            if old_record != record {
-                self.note_entry(slot, entry);
-            }
+            // Always re-register `entry`: `plan()` drains forgotten entries from
+            // `by_entry`, so a slot re-checked with the same record still needs
+            // to be notified if that entry is freed again later.
+            self.note_entry(slot, entry);
             return;
         }
         self.forget(slot);
@@ -362,6 +372,7 @@ impl<C: Clone> Picked<C> {
     /// Slot `slot` holds a buffer view whose memory has no host copy yet.
     pub(crate) fn orphan(&mut self, slot: u32, record: Record, entry: Option<u32>) {
         if self.orphans.get(&slot) == Some(&record) {
+            self.note_entry(slot, entry);
             return;
         }
         self.forget(slot);
@@ -607,5 +618,49 @@ mod tests {
         heap.records.insert(3, [1, 999, 2]);
         let due = pass(&mut p, &heap, vec![5, 3, 3, 1], vec![103, 101]);
         assert_eq!(due, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn forgotten_entry_re_registers_on_repeated_keep_and_orphan_with_same_record() {
+        let heap = heap(4);
+        let mut p: Picked<u32> = Picked::new(false);
+        let _ = p.plan(vec![], || vec![0, 1], |s| heap.record(s), entry);
+        let rec0 = heap.record(0).unwrap();
+        let rec1 = heap.record(1).unwrap();
+        p.keep(0, 10, &10, [0, 16], rec0, entry(rec0));
+        p.orphan(1, rec1, entry(rec1));
+
+        // First forget drains `by_entry` for both entries.
+        p.note_forgotten(Some(&[100, 101]));
+        let due1 = p.plan(vec![], || vec![0, 1], |s| heap.record(s), entry);
+        assert_eq!(due1, vec![0, 1]);
+        // Re-keeping and re-orphaning with the exact same records must re-register `by_entry`.
+        p.keep(0, 10, &10, [0, 16], rec0, entry(rec0));
+        p.orphan(1, rec1, entry(rec1));
+
+        // Second forget of the same entries must still schedule both slots.
+        p.note_forgotten(Some(&[100, 101]));
+        let due2 = p.plan(vec![], || vec![0, 1], |s| heap.record(s), entry);
+        assert_eq!(due2, vec![0, 1]);
+    }
+
+    #[test]
+    fn int_hasher_avalanche_mixes_aligned_pointer_low_bits() {
+        use std::hash::Hash;
+        let bh = IntBuildHasher;
+        let mut low_buckets = HashSet::new();
+        for i in 0..4096usize {
+            let aligned_ptr = 0x0000_0200_0000_0000usize + (i << 6); // 64-byte aligned
+            let mut h = bh.build_hasher();
+            aligned_ptr.hash(&mut h);
+            low_buckets.insert(h.finish() & 0xfff);
+        }
+        // With 4096 uniform hashes into 4096 buckets, expected distinct buckets is ~2590;
+        // unmixed aligned pointers would hit only 64 buckets (`<< 6` leaves 6 zero low bits).
+        assert!(
+            low_buckets.len() > 2000,
+            "aligned pointers collided in low hash bits: only {} distinct buckets",
+            low_buckets.len()
+        );
     }
 }
