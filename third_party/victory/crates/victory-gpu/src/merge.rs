@@ -384,10 +384,15 @@ impl Plan {
     }
 
     /// The held submissions are sent: the signals carried behind them (fence,
-    /// value), in order, and nothing is held.
+    /// value), in order, and nothing is held. Retains the internal buffers'
+    /// capacities for the next batch.
     pub(crate) fn clear(&mut self) -> Vec<(usize, u64)> {
         let signals = self.signals.drain(..).map(|(fence, value, _)| (fence, value)).collect();
-        *self = Plan::new();
+        self.members = 0;
+        self.lists = 0;
+        self.shader.clear();
+        self.brought.clear();
+        self.writes.clear();
         signals
     }
 }
@@ -401,32 +406,37 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     ranges.get(at).is_some_and(|r| r.0 < to)
 }
 
-/// `more` into `into` (in order, joined), joined where they overlap or touch:
-/// `more` is sorted, the two are walked once.
+/// Coalesces overlapping or adjacent ranges in a sorted `Vec` in-place.
+fn compact_sorted(ranges: &mut Vec<(usize, usize)>) {
+    let mut write = 0;
+    for read in 0..ranges.len() {
+        let (from, to) = ranges[read];
+        if write > 0 && from <= ranges[write - 1].1 {
+            ranges[write - 1].1 = ranges[write - 1].1.max(to);
+        } else {
+            ranges[write] = (from, to);
+            write += 1;
+        }
+    }
+    ranges.truncate(write);
+}
+
+/// `more` into `into` (in order, joined), joined where they overlap or touch,
+/// reusing `into`'s buffer capacity in-place.
 fn join(into: &mut Vec<(usize, usize)>, mut more: Vec<(usize, usize)>) {
     more.retain(|r| r.0 < r.1);
     if more.is_empty() {
         return;
     }
-    more.sort_unstable();
-    let old = std::mem::take(into);
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(old.len() + more.len());
-    let (mut a, mut b) = (old.into_iter().peekable(), more.into_iter().peekable());
-    loop {
-        let next = match (a.peek(), b.peek()) {
-            (Some(x), Some(y)) if x <= y => a.next(),
-            (Some(_), Some(_)) => b.next(),
-            (Some(_), None) => a.next(),
-            (None, Some(_)) => b.next(),
-            (None, None) => break,
-        };
-        let Some((from, to)) = next else { break };
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
-        }
+    if into.is_empty() && into.capacity() < more.len() {
+        more.sort_unstable();
+        compact_sorted(&mut more);
+        *into = more;
+        return;
     }
-    *into = out;
+    into.extend(more);
+    into.sort_unstable();
+    compact_sorted(into);
 }
 
 #[cfg(test)]
@@ -634,5 +644,32 @@ mod tests {
         join(&mut into, vec![(25, 26), (5, 10)]);
         assert_eq!(into, [(0, 30), (40, 60), (100, 101)]);
         assert!(touches(&into, 29, 31) && !touches(&into, 30, 40) && !touches(&into, 60, 100));
+    }
+
+    #[test]
+    fn clear_resets_state_while_retaining_buffer_capacity() {
+        let mut plan = Plan::new();
+        plan.take(Touches {
+            lists: 3,
+            shader: vec![(0x1000, 0x2000), (0x4000, 0x5000)],
+            brought: vec![(0x8000, 0x9000)],
+            writes: vec![(0x100, Some(1), 4)],
+            ..Default::default()
+        });
+        assert_eq!(plan.signal(2, 0x200, 7, (0x208, 8)), Signal::Carried);
+        let (shader_cap, brought_cap, writes_cap, signals_cap) = (
+            plan.shader.capacity(),
+            plan.brought.capacity(),
+            plan.writes.capacity(),
+            plan.signals.capacity(),
+        );
+        let signals = plan.clear();
+        assert_eq!(signals, [(0x200, 7)]);
+        assert!(plan.is_empty());
+        assert_eq!(plan.lists(), 0);
+        assert!(plan.shader.is_empty() && plan.shader.capacity() >= shader_cap);
+        assert!(plan.brought.is_empty() && plan.brought.capacity() >= brought_cap);
+        assert!(plan.writes.is_empty() && plan.writes.capacity() >= writes_cap);
+        assert!(plan.signals.is_empty() && plan.signals.capacity() >= signals_cap);
     }
 }
