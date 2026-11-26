@@ -172,13 +172,20 @@ pub(crate) fn value_place(this: This) -> (usize, usize) {
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
+    // Lock-free fast path when the fence has already reached `value`.
+    if fence.value.load(Ordering::Acquire) >= value {
+        if !event.is_null() {
+            set_event(event as usize);
+        }
+        ASKED[0].fetch_add(1, Ordering::Relaxed);
+        return S_OK;
+    }
     // (Neptune) As [`completed_asked`], for a value not reached yet.
     #[cfg(windows)]
-    if fence.value.load(Ordering::Acquire) < value {
-        crate::host::merge_fence_asked(this as usize);
-    }
+    crate::host::merge_fence_asked(this as usize);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
+        drop(waiters);
         if !event.is_null() {
             set_event(event as usize);
         }
@@ -215,17 +222,24 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
-    let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-    fence.value.store(value, Ordering::Release);
-    waiters.retain(|&(wanted, event, since)| {
-        let reached = wanted <= value;
-        if reached {
-            set_event(event);
-            ASKED[2].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
-        !reached
-    });
-    drop(waiters);
+    let mut ready: Vec<(usize, Instant)> = Vec::new();
+    {
+        let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        fence.value.store(value, Ordering::Release);
+        waiters.retain(|&(wanted, event, since)| {
+            let reached = wanted <= value;
+            if reached {
+                ready.push((event, since));
+            }
+            !reached
+        });
+    }
+    // Signal kernel events outside `waiters` so concurrent waiters/signalers do
+    // not block behind `SetEvent`.
+    for (event, since) in ready {
+        set_event(event);
+        ASKED[2].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
     // (cool_fox `e05d463`) A wait sleeping on the value is woken now, after
     // the events are set.
     #[cfg(windows)]
@@ -336,6 +350,46 @@ mod tests {
         assert_eq!(unsafe { *(at as *const u64) }, 5);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_waiters_and_signals_never_miss_an_event() {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 0, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let f_addr = f as usize;
+        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+        let signal = slot::<extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
+        const ROUNDS: u64 = 128;
+        let events: Vec<usize> = (0..ROUNDS)
+            .map(|_| {
+                // SAFETY: plain auto-reset event.
+                let e = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+                assert!(!e.is_null());
+                e as usize
+            })
+            .collect();
+        let events_ref = &events;
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                for i in 1..=ROUNDS {
+                    assert_eq!(signal(f_addr as This, i), S_OK);
+                }
+            });
+            for (idx, &ev) in events_ref.iter().enumerate() {
+                assert_eq!(wait(f_addr as This, idx as u64 + 1, ev as *mut c_void), S_OK);
+            }
+        });
+        for &ev in &events {
+            // SAFETY: valid event; must be signaled either via fast path or `set`.
+            assert_eq!(unsafe { WaitForSingleObject(ev as *mut c_void, 5000) }, WAIT_OBJECT_0);
+            // SAFETY: ours.
+            unsafe { CloseHandle(ev as *mut c_void) };
+        }
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 }
