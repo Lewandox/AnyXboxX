@@ -24,7 +24,7 @@
 //! copy shows what the list's last write left; a title read in between sees
 //! the frame before, as it would before the console's GPU has run.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_formats::texture::{Dimension, Layout, Swizzle};
@@ -82,10 +82,79 @@ pub(crate) fn wanted(resource: This) -> bool {
     !kinds.is_empty() && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
 }
 
+/// Pooled D3D12 read-back buffer reused across texture copy-backs so repeated
+/// ocean/heightmap readbacks do not call `CreateCommittedResource` every frame.
+struct ReadbackBuffer {
+    resource: ID3D12Resource,
+    capacity: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; buffers are only returned to the
+// pool when `Back` drops after its command list has completed on the GPU.
+unsafe impl Send for ReadbackBuffer {}
+
+const READBACK_POOL_MAX_BYTES: u64 = 16 << 20;
+const READBACK_POOL_MAX_BUFFERS: usize = 32;
+
+struct ReadbackPool {
+    buffers: Vec<ReadbackBuffer>,
+    bytes: u64,
+}
+
+static READBACK_POOL: Mutex<ReadbackPool> = Mutex::new(ReadbackPool {
+    buffers: Vec::new(),
+    bytes: 0,
+});
+
+#[cfg(test)]
+thread_local! {
+    static READBACK_ALLOCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn take_readback_buffer(host: &crate::host::Host, total: u64) -> Option<ReadbackBuffer> {
+    let max_fit = total.saturating_mul(2);
+    {
+        let mut pool = READBACK_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let best = pool
+            .buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.capacity >= total && b.capacity <= max_fit)
+            .min_by_key(|(_, b)| b.capacity)
+            .map(|(i, _)| i);
+        if let Some(i) = best {
+            let buf = pool.buffers.swap_remove(i);
+            pool.bytes = pool.bytes.saturating_sub(buf.capacity);
+            return Some(buf);
+        }
+    }
+    let resource = host.read_back_buffer(total)?;
+    #[cfg(test)]
+    READBACK_ALLOCS.with(|c| c.set(c.get() + 1));
+    Some(ReadbackBuffer {
+        resource,
+        capacity: total,
+    })
+}
+
+fn return_readback_buffer(buf: ReadbackBuffer) {
+    if buf.capacity == 0 || buf.capacity > READBACK_POOL_MAX_BYTES / 2 {
+        return;
+    }
+    let mut pool = READBACK_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.buffers.len() >= READBACK_POOL_MAX_BUFFERS
+        || pool.bytes.saturating_add(buf.capacity) > READBACK_POOL_MAX_BYTES
+    {
+        return;
+    }
+    pool.bytes += buf.capacity;
+    pool.buffers.push(buf);
+}
+
 /// A texture's copy into a read-back buffer, recorded into a list, and where
 /// its texels go once the list has run.
 pub(crate) struct Back {
-    buffer: ID3D12Resource,
+    buffer: Option<ReadbackBuffer>,
     buffer_bytes: usize,
     packed_linear: bool,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -95,6 +164,14 @@ pub(crate) struct Back {
     /// The texture's title memory and its layout's bytes.
     at: usize,
     size: usize,
+}
+
+impl Drop for Back {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buffer.take() {
+            return_readback_buffer(buf);
+        }
+    }
 }
 
 /// Records into `list` the copy of `texture` (title resource `resource`'s
@@ -138,11 +215,11 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, resource: This, texture: 
         )
     };
     let packed_linear = total == size as u64 && packed_linear(&layout, &footprints, &rows, row_bytes, total);
-    let buffer = host.read_back_buffer(total)?;
+    let buffer = take_readback_buffer(host, total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            pResource: unsafe { std::mem::transmute_copy(&buffer.resource) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
         };
@@ -155,8 +232,13 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, resource: This, texture: 
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
+    let (footprints, rows) = if packed_linear {
+        (Vec::new(), Vec::new())
+    } else {
+        (footprints, rows)
+    };
     Some(Back {
-        buffer,
+        buffer: Some(buffer),
         buffer_bytes: total as usize,
         packed_linear,
         footprints,
@@ -220,10 +302,13 @@ pub(crate) static LANDED: AtomicU64 = AtomicU64::new(0);
 /// Once the list that recorded `back` has run: its texels, tiled into the
 /// title's layout, into the texture's title memory.
 pub(crate) fn land(back: &Back) {
+    let Some(buffer) = back.buffer.as_ref() else {
+        return;
+    };
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
-        if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+        if buffer.resource.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
             return;
         }
     }
@@ -236,7 +321,7 @@ pub(crate) fn land(back: &Back) {
         land_tiled(back, data)
     };
     // SAFETY: mapped above, and its contents are no longer accessed.
-    unsafe { back.buffer.Unmap(0, None) };
+    unsafe { buffer.resource.Unmap(0, None) };
     if landed {
         LANDED.fetch_add(1, Ordering::Relaxed);
     }

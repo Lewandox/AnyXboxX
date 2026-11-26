@@ -193,6 +193,7 @@ fn packed_linear_readbacks_skip_cpu_scratch() {
     let list = host.new_list().unwrap();
     let mut landing = Duration::ZERO;
     SCRATCH.set((0, 0));
+    READBACK_ALLOCS.with(|c| c.set(0));
     for round in 0..ROUNDS {
         let seed = round.wrapping_mul(17);
         let backs = [
@@ -213,9 +214,10 @@ fn packed_linear_readbacks_skip_cpu_scratch() {
         list.reset();
     }
     let (scratch, peak) = SCRATCH.get();
+    let allocs = READBACK_ALLOCS.with(Cell::get);
     let landed = active * usize::from(ROUNDS);
     eprintln!(
-        "adapter={:?}, readbacks={}, texel_bytes={landed}, scratch_bytes={scratch}, peak_scratch_bytes={peak}, cpu_copy_bytes={}, land_us={}",
+        "adapter={:?}, readbacks={}, readback_allocs={allocs}, texel_bytes={landed}, scratch_bytes={scratch}, peak_scratch_bytes={peak}, cpu_copy_bytes={}, land_us={}",
         crate::host::adapter_summary(),
         u32::from(ROUNDS) * 2,
         landed + 2 * scratch,
@@ -224,6 +226,11 @@ fn packed_linear_readbacks_skip_cpu_scratch() {
     assert_eq!(
         scratch, 0,
         "packed linear readbacks used CPU scratch after every GPU copy"
+    );
+    assert!(
+        allocs <= 2,
+        "expected readback buffer pool reuse across {} rounds, got {allocs} D3D12 allocations",
+        ROUNDS
     );
 }
 
