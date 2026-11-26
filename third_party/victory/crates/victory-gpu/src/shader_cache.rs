@@ -70,12 +70,31 @@ fn build() -> [u8; 32] {
     // (Neptune) The view heap's null slot is part of the translation (it differs by host
     // GPU): found before it goes into the key, so that no translation is made without it.
     crate::descriptor::host::probe_view_limit();
+    let fp = victory_shader::emit::translation_fingerprint();
+    // Cache the computed key against the last fingerprint so steady-state
+    // lookups avoid re-hashing `shader_cache.rs` while still recomputing
+    // immediately if device probing updates the fingerprint.
+    static LAST: std::sync::Mutex<Option<(Vec<u8>, [u8; 32])>> = std::sync::Mutex::new(None);
+    {
+        let last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_fp, cached_key)) = last.as_ref()
+            && *cached_fp == fp
+        {
+            return *cached_key;
+        }
+    }
+    let key = build_for(exe.as_ref(), &fp);
+    *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some((fp, key));
+    key
+}
+
+fn build_for(exe: Option<&[u8; 32]>, fp: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(b"victory shader cache key 2\0");
     if let Some(exe) = exe {
         h.update(exe);
     }
-    h.update(&victory_shader::emit::translation_fingerprint());
+    h.update(fp);
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }
@@ -105,10 +124,11 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 }
 
 /// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// encoded translation out. Keeps the freshly translated `HostShader` so a
+/// miss does not re-read and re-decode the file it just wrote.
 struct Translate<F> {
     translate: F,
-    ran: AtomicBool,
+    produced: std::sync::Mutex<Option<HostShader>>,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -120,9 +140,10 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         1
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
-        self.ran.store(true, Ordering::Relaxed);
         let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        let encoded = encode(&shader);
+        *self.produced.lock().unwrap_or_else(|e| e.into_inner()) = Some(shader);
+        Ok(encoded)
     }
 }
 
@@ -132,23 +153,25 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
+    let mut input = Vec::with_capacity(build.len() + container.len());
+    input.extend_from_slice(build);
+    input.extend_from_slice(container);
     let converter = Translate {
         translate,
-        ran: AtomicBool::new(false),
+        produced: std::sync::Mutex::new(None),
     };
     for _ in 0..2 {
         let path = cache
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
+        if let Some(shader) = converter.produced.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            MISSES.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(path = %path.display(), "shader translated and cached");
+            return Ok(shader);
+        }
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
-                (&MISSES, "translated and cached")
-            } else {
-                (&HITS, "from the cache")
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
+            HITS.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(path = %path.display(), "shader from the cache");
             return Ok(shader);
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
@@ -196,7 +219,26 @@ fn root_type(code: u32) -> RootType {
 
 /// Little-endian words and length-prefixed lists.
 fn encode(s: &HostShader) -> Vec<u8> {
-    let mut out = MAGIC.to_vec();
+    let exact = 4
+        + 4
+        + 4
+        + s.dxil.len()
+        + 4
+        + s.user_data.len() * 16
+        + 4
+        + s.samplers.len() * 16
+        + 4
+        + s.static_samplers.len() * 40
+        + 4
+        + s.root_cbvs.len()
+        + 4
+        + s.root_srvs.len()
+        + 4
+        + s.root_uavs.len()
+        + 4
+        + s.root_indexed_views.len() * 20;
+    let mut out = Vec::with_capacity(exact);
+    out.extend_from_slice(MAGIC);
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u32;
     word(&mut out, stage);
@@ -412,9 +454,22 @@ mod tests {
     #[test]
     fn entries_round_trip_and_reject_damage() {
         let bytes = encode(&shader());
+        assert_eq!(bytes.len(), bytes.capacity());
         assert_eq!(decode(&bytes), Some(shader()));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    #[test]
+    fn build_key_tracks_fingerprint_and_matches_direct_hash() {
+        let fp_a = [1u8; 32];
+        let fp_b = [2u8; 32];
+        let mut h = blake3::Hasher::new();
+        h.update(b"victory shader cache key 2\0");
+        h.update(&fp_a);
+        h.update(include_bytes!("shader_cache.rs"));
+        assert_eq!(build_for(None, &fp_a), *h.finalize().as_bytes());
+        assert_ne!(build_for(None, &fp_a), build_for(None, &fp_b));
     }
 }
