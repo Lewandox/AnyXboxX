@@ -37,7 +37,7 @@ struct Queue {
     /// What the queue was given after a wait for a fence that had not been
     /// reached, in order; it runs when the fence gets there.
     #[cfg(windows)]
-    held: std::sync::Mutex<Vec<Held>>,
+    held: std::sync::Mutex<std::collections::VecDeque<Held>>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -141,7 +141,7 @@ fn present_later() -> bool {
     LATER.1.notify_all();
     for (q, piece) in next {
         // SAFETY: a live queue (the title gave it this piece).
-        lock(unsafe { &(*(q as *const Queue)).held }).push(piece);
+        lock(unsafe { &(*(q as *const Queue)).held }).push_back(piece);
         let mut waiting = lock(&WAITING);
         if !waiting.contains(&q) {
             waiting.push(q);
@@ -200,6 +200,20 @@ fn wake_releaser() {
 #[cfg(windows)]
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(windows)]
+fn shrink_drained_vec<T>(buf: &mut Vec<T>) {
+    if buf.is_empty() && buf.capacity() > 64 {
+        buf.shrink_to(32);
+    }
+}
+
+#[cfg(windows)]
+fn shrink_drained_deque<T>(buf: &mut std::collections::VecDeque<T>) {
+    if buf.is_empty() && buf.capacity() > 64 {
+        buf.shrink_to(32);
+    }
 }
 
 /// Whether queues wait for fences. `VICTORY_QUEUE_WAIT=0`: they do not,
@@ -447,7 +461,7 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
     if held.is_empty() && RUNNING.load(Ordering::Acquire) != this as usize {
         return false;
     }
-    held.push(what());
+    held.push_back(what());
     if async_submit() {
         // Its turn may have come already (the line was run to its end meanwhile).
         let mut waiting = lock(&WAITING);
@@ -501,7 +515,7 @@ pub(crate) fn release_held(all: bool) {
             let held_of = unsafe { &(*(q as *const Queue)).held };
             let mut held = lock(held_of);
             loop {
-                match held.first() {
+                match held.front() {
                     None => break,
                     Some(&Held::Wait(fence, value))
                         if !all && crate::fence::completed(fence as This) < value =>
@@ -514,7 +528,7 @@ pub(crate) fn release_held(all: bool) {
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
                     Some(_) => {}
                 }
-                match held.remove(0) {
+                match held.pop_front().expect("checked non-empty above") {
                     Held::Wait(..) => {}
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
@@ -547,7 +561,10 @@ pub(crate) fn release_held(all: bool) {
                             let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
                             if waits > 0
                                 && matches!(held.get(waits), Some(Held::Run(..)))
-                                && held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met()))
+                                && held
+                                    .iter()
+                                    .take(waits)
+                                    .all(|h| matches!(h, Held::Value(w) if w.met()))
                             {
                                 crate::copystat::add(crate::copystat::C::PartsTogether, 1);
                             }
@@ -609,7 +626,10 @@ pub(crate) fn release_held(all: bool) {
                 moved = true;
             }
             if held.is_empty() {
-                lock(&WAITING).retain(|&w| w != q);
+                shrink_drained_deque(&mut held);
+                let mut waiting = lock(&WAITING);
+                waiting.retain(|&w| w != q);
+                shrink_drained_vec(&mut waiting);
             }
         }
         if !moved && !AGAIN.swap(false, Ordering::AcqRel) {
@@ -702,7 +722,9 @@ extern "system" fn release(this: This) -> u32 {
     let left = object::release_boxed::<Queue>(this);
     #[cfg(windows)]
     if left == 0 {
-        lock(&WAITING).retain(|&q| q != this as usize);
+        let mut waiting = lock(&WAITING);
+        waiting.retain(|&q| q != this as usize);
+        shrink_drained_vec(&mut waiting);
     }
     left
 }
@@ -864,7 +886,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             let mut held = lock(&queue(this).held);
             let behind = !held.is_empty() || now < value || RUNNING.load(Ordering::Acquire) == this as usize;
             if behind && waits() {
-                held.push(Held::Wait(fence as usize, value));
+                held.push_back(Held::Wait(fence as usize, value));
             }
             behind
         };
@@ -1375,5 +1397,28 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drained_queue_buffers_shrink_after_spikes() {
+        let mut deque: std::collections::VecDeque<usize> = std::collections::VecDeque::with_capacity(512);
+        deque.extend(0..256);
+        while deque.pop_front().is_some() {}
+        assert!(deque.capacity() > 64);
+        shrink_drained_deque(&mut deque);
+        assert!(deque.capacity() <= 64);
+
+        let mut vec: Vec<usize> = Vec::with_capacity(512);
+        vec.extend(0..256);
+        vec.clear();
+        assert!(vec.capacity() > 64);
+        shrink_drained_vec(&mut vec);
+        assert!(vec.capacity() <= 64);
+
+        let mut small: std::collections::VecDeque<usize> = std::collections::VecDeque::with_capacity(32);
+        let cap = small.capacity();
+        shrink_drained_deque(&mut small);
+        assert_eq!(small.capacity(), cap);
     }
 }
