@@ -71,12 +71,14 @@ fn mark_waiting(q: usize) {
 }
 
 /// Runs the host command lists for `lists`, avoiding heap allocation when a
-/// single list is submitted.
+/// single list is submitted. Always invokes `host.execute` (even with `&[]`)
+/// so `merge_send(Sync)` still runs when a title list has no host list.
 #[cfg(windows)]
 fn execute_host_lists(host: &crate::host::Host, lists: &[This]) {
     if let &[only] = lists {
-        if let Some(h) = crate::list::host_list(only) {
-            host.execute(&[h]);
+        match crate::list::host_list(only) {
+            Some(h) => host.execute(&[h]),
+            None => host.execute(&[]),
         }
         return;
     }
