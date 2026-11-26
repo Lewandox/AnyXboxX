@@ -1634,13 +1634,14 @@ impl State {
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         for (n, &index) in slots.iter().enumerate() {
-            ranges.forget(index);
             let Some(handle) = heap.handle(index) else {
+                ranges.forget(index);
                 continue;
             };
             let record = crate::descriptor::record_at(handle);
             let entry = crate::descriptor::record_entry(record);
             let Some(view) = host.mirror(index, handle, true) else {
+                ranges.forget(index);
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1663,6 +1664,8 @@ impl State {
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
                 if crate::descriptor::host::buffer_range(&view).is_some_and(|(_, len)| len > 0) {
                     ranges.orphan(index, record, entry);
+                } else {
+                    ranges.forget(index);
                 }
                 continue;
             };

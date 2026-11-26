@@ -19,7 +19,43 @@
 //! Off by default: the old pass (all slots every 16 passes, all spans every
 //! pass) stays. `VICTORY_HEAP_PASS_DIRTY=1` turns the marked pass on.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{BuildHasher, Hasher};
+
+/// Fast deterministic hasher for integer keys (`u32` slot indices and `usize`
+/// host-copy pointers) in the heap pass's internal maps and sets.
+#[derive(Clone, Default)]
+struct IntBuildHasher;
+
+struct IntHasher(u64);
+
+impl BuildHasher for IntBuildHasher {
+    type Hasher = IntHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        IntHasher(0)
+    }
+}
+
+impl Hasher for IntHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.wrapping_mul(0x517c_c1b7_2722_0a95) ^ u64::from(b);
+        }
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (self.0 ^ u64::from(i)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (self.0 ^ (i as u64)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
 
 /// Passes between two looks at every slot, besides those marked.
 pub(crate) const FULL_EVERY: u64 = 256;
@@ -85,10 +121,10 @@ struct Slot {
 
 struct Copy<C> {
     copy: C,
-    slots: HashSet<u32>,
+    slots: HashSet<u32, IntBuildHasher>,
     from: u64,
     to: u64,
-    /// A slot went: the span is worked out again from those left.
+    /// A slot went or shrank off a boundary: the span is worked out again from those left.
     stale: bool,
 }
 
@@ -108,13 +144,15 @@ pub(crate) fn scan_every() -> u64 {
 /// What a pass looks at (see the module).
 pub(crate) struct Picked<C> {
     passes: u64,
-    slots: HashMap<u32, Slot>,
-    copies: HashMap<usize, Copy<C>>,
-    /// Slots that found no host copy, with the record seen.
-    orphans: HashMap<u32, Record>,
+    /// Kept slots in slot order so the per-pass record scan reads title
+    /// descriptor memory sequentially instead of in hash order.
+    slots: BTreeMap<u32, Slot>,
+    copies: HashMap<usize, Copy<C>, IntBuildHasher>,
+    /// Slots that found no host copy, with the record seen, in slot order.
+    orphans: BTreeMap<u32, Record>,
     /// View table entry -> slots whose record named it at their last look
     /// (some may name another by now: checked when used).
-    by_entry: HashMap<u32, Vec<u32>>,
+    by_entry: HashMap<u32, Vec<u32>, IntBuildHasher>,
     /// Table entries freed since the last pass; `None`: not known.
     forgotten: Option<Vec<u32>>,
     /// The old pass (the default; `VICTORY_HEAP_PASS_DIRTY=1` turns it off).
@@ -133,10 +171,10 @@ impl<C: Clone> Picked<C> {
     pub(crate) fn with_scan_every(full: bool, scan_every: u64) -> Self {
         Picked {
             passes: 0,
-            slots: HashMap::new(),
-            copies: HashMap::new(),
-            orphans: HashMap::new(),
-            by_entry: HashMap::new(),
+            slots: BTreeMap::new(),
+            copies: HashMap::with_hasher(IntBuildHasher),
+            orphans: BTreeMap::new(),
+            by_entry: HashMap::with_hasher(IntBuildHasher),
             forgotten: None,
             full,
             scan_every: scan_every.max(1),
@@ -186,7 +224,7 @@ impl<C: Clone> Picked<C> {
             self.clear();
             return all();
         }
-        let mut due: HashSet<u32> = changed.into_iter().collect();
+        let mut due = changed;
         for e in forgotten {
             if let Some(slots) = self.by_entry.remove(&e) {
                 // Only those whose record still names the entry.
@@ -197,21 +235,26 @@ impl<C: Clone> Picked<C> {
                 );
             }
         }
-        if pass.is_multiple_of(every) {
+        let scan_records = pass.is_multiple_of(every);
+        if scan_records {
             for (&slot, kept) in &self.slots {
                 if record(slot) != Some(kept.record) {
-                    due.insert(slot);
+                    due.push(slot);
                 }
             }
         }
         let orphans_too = pass.is_multiple_of(ORPHANS_EVERY);
-        for (&slot, &seen) in &self.orphans {
-            if orphans_too || (pass.is_multiple_of(every) && record(slot) != Some(seen)) {
-                due.insert(slot);
+        if orphans_too || scan_records {
+            for (&slot, &seen) in &self.orphans {
+                if orphans_too || record(slot) != Some(seen) {
+                    due.push(slot);
+                }
             }
         }
-        let mut due: Vec<u32> = due.into_iter().collect();
-        due.sort_unstable();
+        if due.len() > 1 {
+            due.sort_unstable();
+            due.dedup();
+        }
         due
     }
 
@@ -250,6 +293,9 @@ impl<C: Clone> Picked<C> {
 
     /// What slot `slot` held is let go (it is looked at now).
     pub(crate) fn forget(&mut self, slot: u32) {
+        if self.slots.is_empty() && self.orphans.is_empty() {
+            return;
+        }
         self.orphans.remove(&slot);
         let Some(old) = self.slots.remove(&slot) else {
             return;
@@ -276,12 +322,34 @@ impl<C: Clone> Picked<C> {
         record: Record,
         entry: Option<u32>,
     ) {
+        // Fast path: updating a slot that still maps to the same host copy
+        // avoids removing/re-inserting in `copy.slots` and avoids marking the
+        // copy's span stale unless the slot shrank off a boundary.
+        if let Some(old) = self.slots.get_mut(&slot)
+            && old.copy == key
+        {
+            let (old_from, old_to, old_record) = (old.from, old.to, old.record);
+            old.from = from;
+            old.to = to;
+            old.record = record;
+            if let Some(c) = self.copies.get_mut(&key) {
+                if (old_from <= c.from && from > old_from) || (old_to >= c.to && to < old_to) {
+                    c.stale = true;
+                }
+                c.from = c.from.min(from);
+                c.to = c.to.max(to);
+            }
+            if old_record != record {
+                self.note_entry(slot, entry);
+            }
+            return;
+        }
         self.forget(slot);
         self.note_entry(slot, entry);
         self.slots.insert(slot, Slot { copy: key, from, to, record });
         let c = self.copies.entry(key).or_insert_with(|| Copy {
             copy: copy.clone(),
-            slots: HashSet::new(),
+            slots: HashSet::with_hasher(IntBuildHasher),
             from,
             to,
             stale: false,
@@ -293,6 +361,9 @@ impl<C: Clone> Picked<C> {
 
     /// Slot `slot` holds a buffer view whose memory has no host copy yet.
     pub(crate) fn orphan(&mut self, slot: u32, record: Record, entry: Option<u32>) {
+        if self.orphans.get(&slot) == Some(&record) {
+            return;
+        }
         self.forget(slot);
         self.note_entry(slot, entry);
         self.orphans.insert(slot, record);
@@ -315,35 +386,21 @@ impl<C: Clone> Picked<C> {
 
     /// Per host copy, the span its views read: `(copy, from, to)`.
     pub(crate) fn spans(&mut self) -> Vec<(C, u64, u64)> {
-        if self.full {
-            // As the old pass did: from every view, every pass.
-            let mut spans: HashMap<usize, (u64, u64)> = HashMap::new();
-            for s in self.slots.values() {
-                let span = spans.entry(s.copy).or_insert((s.from, s.to));
-                span.0 = span.0.min(s.from);
-                span.1 = span.1.max(s.to);
-            }
-            return spans
-                .into_iter()
-                .filter_map(|(key, (from, to))| Some((self.copies.get(&key)?.copy.clone(), from, to)))
-                .collect();
-        }
         let slots = &self.slots;
-        self.copies
-            .values_mut()
-            .map(|c| {
-                if c.stale {
-                    c.stale = false;
-                    let (mut from, mut to) = (u64::MAX, 0);
-                    for s in c.slots.iter().filter_map(|s| slots.get(s)) {
-                        from = from.min(s.from);
-                        to = to.max(s.to);
-                    }
-                    (c.from, c.to) = (from, to);
+        let mut out = Vec::with_capacity(self.copies.len());
+        for c in self.copies.values_mut() {
+            if c.stale {
+                c.stale = false;
+                let (mut from, mut to) = (u64::MAX, 0);
+                for s in c.slots.iter().filter_map(|s| slots.get(s)) {
+                    from = from.min(s.from);
+                    to = to.max(s.to);
                 }
-                (c.copy.clone(), c.from, c.to)
-            })
-            .collect()
+                (c.from, c.to) = (from, to);
+            }
+            out.push((c.copy.clone(), c.from, c.to));
+        }
+        out
     }
 }
 
@@ -484,5 +541,71 @@ mod tests {
         assert_eq!(interval_for(1, false), 1);
         assert_eq!(interval_for(1, true), ALT_SCAN_EVERY);
         assert_eq!(interval_for(32, true), 32);
+    }
+
+    #[test]
+    fn in_place_keep_avoids_stale_unless_shrinking_a_boundary() {
+        let mut p: Picked<u32> = Picked::new(false);
+        p.keep(0, 1, &1, [100, 200], [1, 10, 1], Some(10));
+        p.keep(1, 1, &1, [150, 250], [1, 11, 1], Some(11));
+        assert!(!p.copies[&1].stale);
+        assert_eq!(p.spans(), vec![(1, 100, 250)]);
+
+        // Re-keeping an unchanged slot or expanding a boundary stays non-stale.
+        p.keep(0, 1, &1, [100, 200], [1, 10, 1], Some(10));
+        assert!(!p.copies[&1].stale);
+        p.keep(0, 1, &1, [80, 200], [1, 10, 2], Some(10));
+        assert!(!p.copies[&1].stale);
+        assert_eq!(p.spans(), vec![(1, 80, 250)]);
+
+        // Shrinking a boundary marks stale and recomputes exact span.
+        p.keep(0, 1, &1, [120, 200], [1, 10, 3], Some(10));
+        assert!(p.copies[&1].stale);
+        assert_eq!(p.spans(), vec![(1, 120, 250)]);
+        assert!(!p.copies[&1].stale);
+
+        // Moving a slot to another host copy shrinks the old copy and creates the new one.
+        p.keep(0, 2, &2, [0, 64], [1, 20, 1], Some(20));
+        let mut spans = p.spans();
+        spans.sort_unstable();
+        assert_eq!(spans, vec![(1, 150, 250), (2, 0, 64)]);
+    }
+
+    #[test]
+    fn full_and_incremental_modes_report_identical_spans() {
+        let mut full: Picked<u32> = Picked::new(true);
+        let mut inc: Picked<u32> = Picked::new(false);
+        let sorted_spans = |p: &mut Picked<u32>| {
+            let mut s = p.spans();
+            s.sort_unstable();
+            s
+        };
+        for p in [&mut full, &mut inc] {
+            p.keep(0, 10, &10, [64, 128], [1, 1, 1], Some(1));
+            p.keep(1, 10, &10, [128, 256], [1, 2, 1], Some(2));
+            p.keep(2, 20, &20, [0, 32], [1, 3, 1], Some(3));
+        }
+        assert_eq!(sorted_spans(&mut full), sorted_spans(&mut inc));
+        assert_eq!(sorted_spans(&mut full), vec![(10, 64, 256), (20, 0, 32)]);
+
+        // Shrink upper boundary, remove lower boundary, and switch copy.
+        for p in [&mut full, &mut inc] {
+            p.keep(1, 10, &10, [128, 192], [1, 2, 2], Some(2));
+            p.forget(0);
+            p.keep(2, 10, &10, [16, 48], [1, 3, 2], Some(3));
+        }
+        assert_eq!(sorted_spans(&mut full), sorted_spans(&mut inc));
+        assert_eq!(sorted_spans(&mut full), vec![(10, 16, 192)]);
+    }
+
+    #[test]
+    fn plan_deduplicates_and_sorts_due_slots_across_all_sources() {
+        let mut heap = heap(8);
+        let mut p = Picked::new(false);
+        pass(&mut p, &heap, vec![], vec![]);
+        // Slot 3 changes in title memory AND is passed in `changed` twice AND its entry is forgotten.
+        heap.records.insert(3, [1, 999, 2]);
+        let due = pass(&mut p, &heap, vec![5, 3, 3, 1], vec![103, 101]);
+        assert_eq!(due, vec![1, 3, 5]);
     }
 }
