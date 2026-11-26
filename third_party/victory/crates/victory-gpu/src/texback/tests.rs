@@ -266,3 +266,81 @@ fn padded_linear_readback_reuses_capped_cpu_scratch() {
     let cap = TILED_SCRATCH.with(|cell| cell.borrow().capacity());
     assert!(cap <= TILED_SCRATCH_CAP);
 }
+
+#[test]
+fn overlapping_in_flight_readbacks_keep_distinct_buffers_until_fence_completes() {
+    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+
+    let Some(host) = host() else {
+        eprintln!("Skipped overlapping readback test because no D3D12 device was available");
+        return;
+    };
+    // Two same-sized textures share the exact same readback pool size bucket.
+    let image_a = Image::new(host, 256, 256, DXGI_FORMAT_R32_FLOAT);
+    let image_b = Image::new(host, 256, 256, DXGI_FORMAT_R32_FLOAT);
+    let list_a = host.new_list().unwrap();
+    let list_b = host.new_list().unwrap();
+    // SAFETY: valid D3D12 fence and Win32 auto-reset event.
+    let fence: ID3D12Fence =
+        unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+    let event = unsafe { CreateEventW(None, false, false, None) }.unwrap();
+
+    let mut fence_val = 0u64;
+    for (round, (seed_a, seed_b)) in [(0x11u8, 0x77u8), (0x35u8, 0xc9u8)].into_iter().enumerate() {
+        if round == 1 {
+            // Both buffers from round 0 are now back in the pool; round 1 must reuse them
+            // without allocating new D3D12 resources while still keeping them distinct in flight.
+            READBACK_ALLOCS.with(|c| c.set(0));
+        }
+        let back_a = image_a.record(&list_a, seed_a);
+        list_a.close();
+        let cmd_a: ID3D12CommandList = list_a.list.cast().unwrap();
+        fence_val += 1;
+        let first_fence = fence_val;
+        // Submit the first readback and do NOT wait before recording and submitting the second.
+        // SAFETY: closed command list and live queue/fence.
+        unsafe {
+            host.queue().ExecuteCommandLists(&[Some(cmd_a)]);
+            host.queue().Signal(&fence, first_fence).unwrap();
+        }
+
+        let back_b = image_b.record(&list_b, seed_b);
+        assert_ne!(
+            back_a.buffer.as_ref().unwrap().resource.as_raw(),
+            back_b.buffer.as_ref().unwrap().resource.as_raw(),
+            "second in-flight readback must not alias the first buffer before it is returned"
+        );
+        list_b.close();
+        let cmd_b: ID3D12CommandList = list_b.list.cast().unwrap();
+        fence_val += 1;
+        let second_fence = fence_val;
+        // SAFETY: closed command list and live queue/fence.
+        unsafe {
+            host.queue().ExecuteCommandLists(&[Some(cmd_b)]);
+            host.queue().Signal(&fence, second_fence).unwrap();
+            fence.SetEventOnCompletion(second_fence, event).unwrap();
+            WaitForSingleObject(event, INFINITE);
+        }
+
+        land(&back_a);
+        land(&back_b);
+        image_a.check(seed_a);
+        image_b.check(seed_b);
+        drop(back_a);
+        drop(back_b);
+        list_a.reset();
+        list_b.reset();
+
+        if round == 1 {
+            let allocs = READBACK_ALLOCS.with(Cell::get);
+            assert_eq!(
+                allocs, 0,
+                "expected second overlapping pair to reuse the two pooled buffers without new allocations"
+            );
+        }
+    }
+    // SAFETY: event handle created above.
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(event);
+    }
+}
