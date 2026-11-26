@@ -17,7 +17,6 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -408,7 +407,7 @@ struct Lane {
     unsubmitted: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    reads: VecDeque<(u64, Request, Option<Vec<usize>>)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -425,6 +424,7 @@ struct Job {
     lane: u64,
     seq: u64,
     request: Request,
+    enqueued_pages: Option<Vec<usize>>,
     staging: u64,
 }
 
@@ -536,7 +536,7 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = execute(&job.request, job.enqueued_pages.as_deref());
         walls_request(&job.request, &result, started);
         lanes = scheduler.lock();
         lanes.finish(&job, result);
@@ -604,14 +604,13 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let staging = staging_bytes(&lane.reads.front()?.1);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, request, enqueued_pages) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -623,6 +622,7 @@ impl Lanes {
             lane: id,
             seq,
             request,
+            enqueued_pages,
             staging,
         })
     }
@@ -662,7 +662,9 @@ impl Lanes {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(request, enqueued_pages) => {
+                    lane.reads.push_back((seq, request, enqueued_pages))
+                }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
@@ -783,7 +785,7 @@ const MEMORY_SOURCE: u64 = 1 << 22;
 const PAGE: usize = 64 * 1024;
 
 enum Command {
-    Read(Request),
+    Read(Request, Option<Vec<usize>>),
     Status(Status),
 }
 
@@ -812,8 +814,8 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    as_enqueued(&request);
-    queue(this, Command::Read(request));
+    let enqueued_pages = snapshot_enqueued(&request);
+    queue(this, Command::Read(request, enqueued_pages));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -883,8 +885,52 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// Maximum capacity retained per worker thread-local scratch buffer.
+/// Oversized buffers are dropped on return so idle workers do not retain
+/// large streaming allocations.
+const SCRATCH_CAP: usize = 4 << 20;
+/// Maximum number of reusable scratch buffers kept per worker thread
+/// (e.g. compressed source + intermediate inflate or non-consecutive pages).
+const SCRATCH_SLOTS: usize = 2;
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` with a reusable thread-local byte buffer of `size` bytes.
+/// Callers overwrite the slice before reading; buffers larger than
+/// [`SCRATCH_CAP`] are released when the scope exits.
+fn with_scratch<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    struct Guard(Option<Vec<u8>>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Some(buf) = self.0.take()
+                && buf.capacity() <= SCRATCH_CAP
+            {
+                let _ = SCRATCH.try_with(|pool| {
+                    let mut pool = pool.borrow_mut();
+                    if pool.len() < SCRATCH_SLOTS {
+                        pool.push(buf);
+                    }
+                });
+            }
+        }
+    }
+    let mut buf = SCRATCH
+        .try_with(|pool| pool.borrow_mut().pop())
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if buf.len() < size {
+        buf.resize(size, 0);
+    }
+    let mut guard = Guard(Some(buf));
+    let slice = &mut guard.0.as_mut().unwrap()[..size];
+    f(slice)
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(request: &Request, enqueued_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -922,33 +968,37 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         // world's first frame). It is read beside and copied in: our copy
         // faults into the guard like the title's own writes.
         let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
-        return into_destination(request, size, |out| {
+        return into_destination(request, size, enqueued_pages, |out| {
             if !bounce {
                 return read_into(request, out).map(|()| size);
             }
-            let mut data = vec![0; size];
-            read_into(request, &mut data)?;
-            out.copy_from_slice(&data);
-            Ok(size)
+            with_scratch(size, |data| {
+                read_into(request, data)?;
+                out.copy_from_slice(data);
+                Ok(size)
+            })
         })
         .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
-    // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
-    } else {
-        source
-    };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+    with_source(request, |source| {
+        let decode_into = |src: &[u8]| {
+            into_destination(request, size, enqueued_pages, |out| match tables {
+                Some(tables) => bcpack::decode(bc, src, out, tables)
+                    .map(|()| out.len())
+                    .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+                None => inflate(src, out).map_err(|hr| fail(hr, "zlib")),
+            })
+        };
+        // The console's order: zlib first, then BCPack.
+        if bc != 0 && options & ZLIB != 0 {
+            with_scratch(request.intermediate_size as usize, |packed| {
+                let n = inflate(source, packed).map_err(|hr| fail(hr, "zlib"))?;
+                decode_into(&packed[..n])
+            })
+        } else {
+            decode_into(source)
+        }
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1053,18 +1103,35 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// Runs `f` with a compressed request's source bytes: borrowed directly from
+/// memory, or read from the file into a reusable thread-local scratch buffer.
+fn with_source<R>(
+    request: &Request,
+    f: impl FnOnce(&[u8]) -> Result<R, HRESULT>,
+) -> Result<R, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return f(bytes);
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    with_scratch(size, |bytes| {
+        read_into(request, bytes).map_err(|hr| {
+            tracing::warn!(
+                options = format_args!("{:#x}", request.options),
+                offset = request.offset,
+                source_size = request.source_size,
+                destination_size = request.destination_size,
+                intermediate_size = request.intermediate_size,
+                tag = request.tag,
+                name = text(request.name),
+                hr = format_args!("{:#010x}", hr as u32),
+                "dstorage: request failed: reading the source"
+            );
+            hr
+        })?;
+        f(bytes)
+    })
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -1119,6 +1186,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 fn into_destination(
     request: &Request,
     len: usize,
+    enqueued_pages: Option<&[usize]>,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
@@ -1140,7 +1208,7 @@ fn into_destination(
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
+    let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE), enqueued_pages)[..];
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
@@ -1154,110 +1222,148 @@ fn into_destination(
         super::xmem::pages_written(pages, offset, len);
         return filled;
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
-    // A page the title has just made, or a view the host refuses for a
-    // moment, comes right a little later: the write is tried again before
-    // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
-    // in all; 0: not tried again, as before). Runs 175-178 lost 12 to 446
-    // reads a launch here, all in one second of the loading; the one build
-    // that tried again (run 165) lost none of 13.
-    static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12)
-    });
-    // Since the start: writes that succeeded on a later try, and writes
-    // given up.
-    static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
-    let mut tries = 0u32;
-    while !written && tries < retries {
-        std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
-        tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
-    }
-    if written {
-        if tries > 0 {
-            let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::info!(
+    with_scratch(len, |data| {
+        let n = fill(data)?;
+        // A page the title has just made, or a view the host refuses for a
+        // moment, comes right a little later: the write is tried again before
+        // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
+        // in all; 0: not tried again, as before). Runs 175-178 lost 12 to 446
+        // reads a launch here, all in one second of the loading; the one build
+        // that tried again (run 165) lost none of 13.
+        static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let retries = *RETRIES.get_or_init(|| {
+            std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12)
+        });
+        // Since the start: writes that succeeded on a later try, and writes
+        // given up.
+        static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+        let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+        let mut tries = 0u32;
+        while !written && tries < retries {
+            std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
+            tries += 1;
+            written = super::xmem::write_physical(pages, offset, &data[..n]);
+        }
+        if written {
+            if tries > 0 {
+                let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::info!(
+                    offset,
+                    len,
+                    tries,
+                    on_a_retry,
+                    given_up = RETRIED[1].load(Ordering::Relaxed),
+                    "dstorage: a destination's physical pages written after a retry"
+                );
+            }
+            // As above, after the write that succeeded.
+            super::xmem::pages_written(pages, offset, n);
+            Ok(())
+        } else {
+            let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::warn!(
+                known = super::xmem::pages_known(pages, offset, len),
+                tries,
+                given_up,
+                on_a_retry = RETRIED[0].load(Ordering::Relaxed),
+                "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
+            );
+            // Said aloud: the title never reads a request's result
+            // (it only polls for completion), so a destination left unwritten
+            // is a model or texture that silently holds whatever its pages
+            // held before.
+            tracing::warn!(
                 offset,
                 len,
-                tries,
-                on_a_retry,
-                given_up = RETRIED[1].load(Ordering::Relaxed),
-                "dstorage: a destination's physical pages written after a retry"
+                pages = pages.len(),
+                first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
+                options = format_args!("{:#x}", request.options),
+                "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
             );
+            Err(E_INVALIDARG)
         }
-        // As above, after the write that succeeded.
-        super::xmem::pages_written(pages, offset, n);
-        Ok(())
-    } else {
-        let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::warn!(
-            known = super::xmem::pages_known(pages, offset, len),
-            tries,
-            given_up,
-            on_a_retry = RETRIED[0].load(Ordering::Relaxed),
-            "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
-        );
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            pages = pages.len(),
-            first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
-            options = format_args!("{:#x}", request.options),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
-    }
+    })
 }
 
-/// (Neptune) What the page arrays of the requests not yet run held when they were enqueued,
-/// by the array's address, in the order of the requests ([`as_enqueued`]).
-static ENQUEUED: Mutex<Option<HashMap<usize, VecDeque<Vec<usize>>>>> = Mutex::new(None);
-
-/// (Neptune) What each page array held when a request last ran with it, by the array's
-/// address: an array that holds that still at the next request's enqueue has not been
-/// touched since, and only such a one is waited for ([`filled`]). An array the title filled
-/// before it enqueued holds other numbers than its last use's and is taken at once: waiting
-/// for every array that was the same at enqueue and at the run held a seventh of all
-/// requests for 20 ms each (32,389 of 243,651 in a launch, of which three were the stale
-/// ones), and the load took 20 s longer.
-static LAST_RUN: Mutex<Option<HashMap<usize, Vec<usize>>>> = Mutex::new(None);
-
-/// (Neptune) By array: how many requests in a row ran with the pages of the one before after
-/// the whole wait had passed and the array stood unchanged. From [`SAME_TRUSTED`] on the
-/// array is one the title reads into the same pages with every time (its buffers for what it
-/// streams: half of all requests, 22,497 of 135,639 in run ve139, a third of the workers'
-/// time spent waiting on them), and is not waited for any more. A request with other pages
-/// starts the count again.
-static SAME_RUNS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+/// Maximum number of distinct page-array addresses tracked in [`PAGE_HISTORY`]
+/// so long sessions with churning array addresses cannot grow unboundedly.
+const MAX_PAGE_HISTORY: usize = 4096;
 const SAME_TRUSTED: u32 = 3;
 
-/// (Neptune) Requests not waited for because their array is trusted ([`SAME_RUNS`]).
-static TRUSTED: AtomicU64 = AtomicU64::new(0);
-
-fn same_runs(array: usize, set: Option<u32>) -> u32 {
-    let mut all = SAME_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-    let runs = all.get_or_insert_with(HashMap::new).entry(array).or_insert(0);
-    match set {
-        Some(0) => *runs = 0,
-        Some(_) => *runs = runs.saturating_add(1),
-        None => {}
-    }
-    *runs
+struct PageHistoryEntry {
+    pages: Vec<usize>,
+    same_runs: u32,
+    last_seen: u64,
 }
+
+#[derive(Default)]
+struct PageHistory {
+    entries: HashMap<usize, PageHistoryEntry>,
+    tick: u64,
+}
+
+impl PageHistory {
+    fn check_untouched(&mut self, array: usize, pages: &[usize]) -> (bool, u32) {
+        let Some(entry) = self.entries.get_mut(&array) else {
+            return (false, 0);
+        };
+        let untouched = entry.pages.len() >= pages.len() && entry.pages[..pages.len()] == *pages;
+        if !untouched {
+            entry.same_runs = 0;
+        }
+        (untouched, entry.same_runs)
+    }
+
+    fn set_same_runs(&mut self, array: usize, increment: bool) {
+        if let Some(entry) = self.entries.get_mut(&array) {
+            if increment {
+                entry.same_runs = entry.same_runs.saturating_add(1);
+            } else {
+                entry.same_runs = 0;
+            }
+        }
+    }
+
+    fn record(&mut self, array: usize, pages: Vec<usize>) {
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
+        if let Some(entry) = self.entries.get_mut(&array) {
+            entry.pages = pages;
+            entry.last_seen = tick;
+            return;
+        }
+        if self.entries.len() >= MAX_PAGE_HISTORY {
+            // Evict the oldest quarter of entries in one pass (amortized O(1)).
+            let evict = (MAX_PAGE_HISTORY / 4).max(1);
+            let mut ages: Vec<u64> = self.entries.values().map(|e| e.last_seen).collect();
+            let (_, &mut cutoff, _) = ages.select_nth_unstable(evict - 1);
+            self.entries.retain(|_, e| e.last_seen > cutoff);
+            while self.entries.len() >= MAX_PAGE_HISTORY {
+                let Some(&oldest) = self.entries.iter().min_by_key(|(_, e)| e.last_seen).map(|(k, _)| k) else {
+                    break;
+                };
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(array, PageHistoryEntry { pages, same_runs: 0, last_seen: tick });
+    }
+}
+
+/// (Neptune) Per page-array address: what the array held when a request last
+/// ran with it and how many consecutive requests waited the full stale window
+/// without seeing a change (trusted from [`SAME_TRUSTED`] on). Bounded by
+/// [`MAX_PAGE_HISTORY`].
+static PAGE_HISTORY: Mutex<Option<PageHistory>> = Mutex::new(None);
+
+/// (Neptune) Requests not waited for because their array is trusted ([`PAGE_HISTORY`]).
+static TRUSTED: AtomicU64 = AtomicU64::new(0);
 
 /// Since the last summary: requests whose page array still held, when they ran, the numbers
 /// it had at enqueue (its last use's); of them, those whose array changed while the request
 /// waited for it; and the microseconds waited in all.
 static STALE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-/// (Neptune) Notes what the page array of `request` holds as it is enqueued.
+/// (Neptune) Snapshots what the page array of `request` holds as it is enqueued.
 ///
 /// The title fills the array after it has enqueued the request. Until it has, the array
 /// holds zeros, which [`filled`] waits for, or the numbers of its last use, which nothing
@@ -1267,21 +1373,22 @@ static STALE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// the workers reach a request the more often: with a handle of their own for each read
 /// they found the array still zero 16 times in a launch, from none to two before.
 /// `VICTORY_DSTORAGE_STALE_MS=0`: not noted, as before.
-fn as_enqueued(request: &Request) {
+///
+/// Attached directly to the queued request instead of a global map so closing a queue or
+/// failing before `into_destination` cannot leak snapshots or desync later requests.
+fn snapshot_enqueued(request: &Request) -> Option<Vec<usize>> {
     if request.options & PAGE_DESTINATION == 0 || request.destination.is_null() || stale_wait().is_zero() {
-        return;
+        return None;
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let n = (offset + request.destination_size as usize).div_ceil(PAGE);
     let array = request.destination.cast::<usize>();
     // SAFETY: the title passes a page number per 64 KiB of destination.
-    let now: Vec<usize> = (0..n).map(|i| unsafe { array.add(i).read_volatile() }).collect();
-    let mut all = ENQUEUED.lock().unwrap_or_else(|e| e.into_inner());
-    all.get_or_insert_with(HashMap::new).entry(array as usize).or_default().push_back(now);
+    Some((0..n).map(|i| unsafe { array.add(i).read_volatile() }).collect())
 }
 
 /// How long a request waits for a page array that still holds what it held at enqueue
-/// (`VICTORY_DSTORAGE_STALE_MS`, 20).
+/// (`VICTORY_DSTORAGE_STALE_MS`, 10).
 fn stale_wait() -> std::time::Duration {
     static MS: OnceLock<u64> = OnceLock::new();
     std::time::Duration::from_millis(*MS.get_or_init(|| {
@@ -1296,7 +1403,7 @@ fn stale_wait() -> std::time::Duration {
 /// enqueued the request (a copy taken then holds zeros, or the numbers of
 /// the array's last use), so it is read when the request runs; a number
 /// that is still zero then is waited for, a tenth of a second at most.
-fn filled(array: *const usize, n: usize) -> Vec<usize> {
+fn filled(array: *const usize, n: usize, before: Option<&[usize]>) -> Vec<usize> {
     static LATE: AtomicU64 = AtomicU64::new(0);
     let read = || -> Vec<usize> {
         // SAFETY: the title passes a page number per 64 KiB of destination
@@ -1305,30 +1412,12 @@ fn filled(array: *const usize, n: usize) -> Vec<usize> {
         (0..n).map(|i| unsafe { array.add(i).read_volatile() }).collect()
     };
     let mut pages = read();
-    // (Neptune) What the array held when this request was enqueued ([`as_enqueued`]): while
-    // it holds that still, and that is not zeros, the title has not filled it for this
-    // request yet (or asks for the same pages again, which a short wait does not harm).
-    let before = {
-        let mut all = ENQUEUED.lock().unwrap_or_else(|e| e.into_inner());
-        let found = all.as_mut().and_then(|all| {
-            let line = all.get_mut(&(array as usize))?;
-            let before = line.pop_front();
-            if line.is_empty() {
-                all.remove(&(array as usize));
-            }
-            before
-        });
-        found
+    let (untouched, trusted_runs) = {
+        let mut history = PAGE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+        history
+            .as_mut()
+            .map_or((false, 0), |h| h.check_untouched(array as usize, &pages))
     };
-    let untouched = {
-        let last = LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
-        last.as_ref()
-            .and_then(|last| last.get(&(array as usize)))
-            .is_some_and(|last| last.len() >= n && last[..n] == pages[..])
-    };
-    if !untouched {
-        same_runs(array as usize, Some(0));
-    }
     if let Some(before) = before
         && untouched
         && before.iter().any(|&p| p != 0)
@@ -1336,7 +1425,7 @@ fn filled(array: *const usize, n: usize) -> Vec<usize> {
         && before.len() >= n
         && before[..n] == pages[..]
     {
-        if same_runs(array as usize, None) >= SAME_TRUSTED {
+        if trusted_runs >= SAME_TRUSTED {
             TRUSTED.fetch_add(1, Ordering::Relaxed);
         } else {
             STALE[0].fetch_add(1, Ordering::Relaxed);
@@ -1347,18 +1436,22 @@ fn filled(array: *const usize, n: usize) -> Vec<usize> {
                 pages = read();
             }
             STALE[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
-            if before[..n] != pages[..] {
+            let changed = before[..n] != pages[..];
+            if changed {
                 STALE[1].fetch_add(1, Ordering::Relaxed);
-                same_runs(array as usize, Some(0));
-            } else {
-                same_runs(array as usize, Some(1));
             }
+            let mut history = PAGE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+            history
+                .get_or_insert_with(PageHistory::default)
+                .set_same_runs(array as usize, !changed);
         }
     }
     if !pages.contains(&0) {
         if !stale_wait().is_zero() {
-            let mut last = LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
-            last.get_or_insert_with(HashMap::new).insert(array as usize, pages.clone());
+            let mut history = PAGE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+            history
+                .get_or_insert_with(PageHistory::default)
+                .record(array as usize, pages.clone());
         }
         return pages;
     }
@@ -1378,8 +1471,10 @@ fn filled(array: *const usize, n: usize) -> Vec<usize> {
         );
     }
     if !stale_wait().is_zero() {
-        let mut last = LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
-        last.get_or_insert_with(HashMap::new).insert(array as usize, pages.clone());
+        let mut history = PAGE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+        history
+            .get_or_insert_with(PageHistory::default)
+            .record(array as usize, pages.clone());
     }
     pages
 }
@@ -1544,11 +1639,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
             array[1].store(8, Ordering::Release);
         });
-        assert_eq!(filled(array.as_ptr().cast(), 2), [7, 8]);
+        assert_eq!(filled(array.as_ptr().cast(), 2, None), [7, 8]);
         title.join().unwrap();
         // One never filled is given up on.
         array[0].store(0, Ordering::Release);
-        assert_eq!(filled(array.as_ptr().cast(), 2), [0, 8]);
+        assert_eq!(filled(array.as_ptr().cast(), 2, None), [0, 8]);
     }
 
     #[test]
@@ -1700,7 +1795,7 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
+        lane.unsubmitted.push(Command::Read(r, None));
     }
 
     #[test]
@@ -2024,5 +2119,86 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn page_history_evicts_oldest_entries_at_cap() {
+        let mut history = PageHistory::default();
+        for addr in 1..=(MAX_PAGE_HISTORY + 500) {
+            history.record(addr, vec![addr]);
+            assert!(history.entries.len() <= MAX_PAGE_HISTORY);
+        }
+        // Most recent entries are retained and preserve untouched/same_runs checks.
+        let latest = MAX_PAGE_HISTORY + 500;
+        assert_eq!(history.check_untouched(latest, &[latest]), (true, 0));
+        history.set_same_runs(latest, true);
+        assert_eq!(history.check_untouched(latest, &[latest]), (true, 1));
+        assert_eq!(history.check_untouched(latest, &[latest + 1]), (false, 0));
+    }
+
+    #[test]
+    fn scratch_pool_reuses_capped_buffers_and_drops_oversized() {
+        // Nested scopes get independent buffers and reuse capacity up to SCRATCH_CAP.
+        let (outer_ptr, inner_ptr) = with_scratch(4096, |outer| {
+            outer.fill(0x11);
+            let inner_ptr = with_scratch(2048, |inner| {
+                inner.fill(0x22);
+                assert!(outer.iter().all(|&b| b == 0x11));
+                inner.as_ptr() as usize
+            });
+            (outer.as_ptr() as usize, inner_ptr)
+        });
+        assert_ne!(outer_ptr, inner_ptr);
+
+        // Next call reuses one of the pooled allocations without reallocating.
+        let reused_ptr = with_scratch(1024, |buf| buf.as_ptr() as usize);
+        assert!(reused_ptr == outer_ptr || reused_ptr == inner_ptr);
+
+        // Oversized allocation (> SCRATCH_CAP) is dropped instead of retained.
+        let before = SCRATCH.with(|pool| pool.borrow().len());
+        with_scratch(SCRATCH_CAP + 4096, |huge| {
+            huge[0] = 1;
+            huge[SCRATCH_CAP] = 2;
+        });
+        let after = SCRATCH.with(|pool| pool.borrow().len());
+        assert!(after <= before);
+        assert!(SCRATCH.with(|pool| pool.borrow().iter().all(|b| b.capacity() <= SCRATCH_CAP)));
+    }
+
+    #[test]
+    fn closed_and_failed_page_requests_do_not_corrupt_subsequent_snapshots() {
+        use crate::modules::xmem;
+        let mut pages = [0usize; 1];
+        let mut n = 1;
+        assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+
+        // Enqueue a PAGE_DESTINATION request on a queue that is then closed without running.
+        let closed_q = new_queue(1);
+        let plain = pattern(64);
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            pages.as_mut_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        enqueue(closed_q, &r);
+        void(closed_q, 0x40); // close before submit
+
+        // Enqueue a failing PAGE_DESTINATION request (source larger than destination) on the same page array.
+        let q = new_queue(1);
+        let arr = status_array(2);
+        let mut bad = r;
+        bad.source_size = bad.destination_size + 1;
+        enqueue(q, &bad);
+        enqueue_status(q, arr, 0);
+        // Followed by a valid request reusing the same page array.
+        enqueue(q, &r);
+        enqueue_status(q, arr, 1);
+        void(q, 0x30);
+        assert_eq!(wait(arr, 0), E_INVALIDARG);
+        assert_eq!(wait(arr, 1), S_OK);
+        assert_eq!(xmem::XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 }
