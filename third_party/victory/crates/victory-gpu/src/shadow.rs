@@ -4435,7 +4435,7 @@ impl Shadow {
             // stays clean for the refreshes.
             if crate::watch::guarded_clean(start + at, n)
                 && let Some(alias) = crate::inplace::host_alias(start + at, n)
-                && crate::host::write_alias(alias, title.as_ptr(), n)
+                && crate::host::write_alias(alias.as_mut_ptr(), title.as_ptr(), n)
             {
                 crate::descriptor::host::remapped(start + at, n);
                 let marks = crate::watch::ours_through(start + at, n);

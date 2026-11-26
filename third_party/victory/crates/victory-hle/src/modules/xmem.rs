@@ -583,11 +583,19 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     if pages.is_null() {
         return 0;
     }
-    let mut physical = physical();
-    for i in 0..n {
-        // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+    let mut dropped = Vec::with_capacity(n);
+    {
+        let mut physical = physical();
+        for i in 0..n {
+            // SAFETY: the title passes `n` page numbers.
+            if let Some(slice) = physical.pages.remove(&unsafe { *pages.add(i) }) {
+                dropped.push(slice);
+            }
+        }
     }
+    // Drop `Slice`/`Section` outside `PHYSICAL` so `title_memory_section_closed`
+    // and `CloseHandle` never run under the page-table lock.
+    drop(dropped);
     1
 }
 

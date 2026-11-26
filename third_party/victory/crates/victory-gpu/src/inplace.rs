@@ -37,7 +37,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -287,31 +287,30 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     // (Neptune) A view of our own of a section this handle named before is of that one.
-    {
-        let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((host, _)) = aliases.remove(&section)
-            && host != 0
-        {
-            // SAFETY: a view this module mapped.
-            unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: host as *mut c_void }) };
-        }
-    }
-    views().sections.insert(section, (bytes, committed));
+    // Keep a single lock order (`VIEWS` -> `ALIASES`) and drop any replaced mapping outside locks.
+    let old = {
+        let mut v = views();
+        v.sections.insert(section, (bytes, committed));
+        ALIASES.lock().unwrap_or_else(|e| e.into_inner()).remove(&section)
+    };
+    drop(old);
 }
 
 /// The runtime closed `section` (its last page and view are gone): our own
 /// view of it, if any, goes too, before Windows can give the handle's
 /// number to another section. With `VICTORY_SECTION_MB` there are
 /// thousands of sections, so they are not left for a number to come round.
+///
+/// Any in-flight writer holding a [`HostAlias`] keeps the view mapped via
+/// `Arc<AliasView>` until its write completes, preventing use-after-unmap and
+/// virtual-address reuse corruption.
 pub fn title_memory_section_closed(section: usize) {
-    views().sections.remove(&section);
-    if let Some(host) = ALIASES.lock().unwrap_or_else(|e| e.into_inner()).remove(&section).map(|a| a.0)
-        && host != 0
-    {
-        // SAFETY: a view this module mapped. A copy still writing through it
-        // (`crate::host::write_alias`) faults, ends there and falls back.
-        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: host as *mut c_void }) };
-    }
+    let old = {
+        let mut v = views();
+        v.sections.remove(&section);
+        ALIASES.lock().unwrap_or_else(|e| e.into_inner()).remove(&section)
+    };
+    drop(old);
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
@@ -376,42 +375,76 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// Owned mapping of a title section (`MapViewOfFile`), unmapped only when both
+/// `ALIASES` and every active [`HostAlias`] guard have dropped it.
+struct AliasView {
+    host: usize,
+}
+
+impl Drop for AliasView {
+    fn drop(&mut self) {
+        if self.host != 0 {
+            // SAFETY: a view this module mapped; no active writer holds a reference to it.
+            unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: self.host as *mut c_void }) };
+        }
+    }
+}
+
+/// Keeps the underlying section mapping alive while the caller writes through `ptr`.
+pub(crate) struct HostAlias {
+    _view: Arc<AliasView>,
+    ptr: *mut u8,
+}
+
+impl HostAlias {
+    pub(crate) fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+}
+
 /// (Neptune) Views of our own of the title's sections, whole and writable, by the section's
-/// handle: the address (0: it could not be mapped) and the section's bytes.
-static ALIASES: LazyLock<Mutex<HashMap<usize, (usize, u64)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// handle (`host == 0` caches a failed mapping attempt).
+static ALIASES: LazyLock<Mutex<HashMap<usize, Arc<AliasView>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// (Neptune) Where the bytes of title view memory `[at, at + len)` are in a view of our own of
 /// the same section: the same physical pages at an address the guards know nothing of.
 /// What is written there is in title memory at once, with no protection changed and no
 /// fault; who writes there tells the journal itself (`crate::watch::ours_through`).
 /// `None` if the range is not inside one title view, or the section cannot be mapped.
-pub(crate) fn host_alias(at: usize, len: usize) -> Option<*mut u8> {
-    let (within, bytes, section, offset, size) = {
-        let v = views();
-        let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
-        let size = v.sections.get(&section).map(|s| s.0)?;
-        (at.checked_sub(base)?, bytes, section, offset, size)
-    };
+pub(crate) fn host_alias(at: usize, len: usize) -> Option<HostAlias> {
+    let v = views();
+    let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
+    let size = v.sections.get(&section).map(|s| s.0)?;
+    let within = at.checked_sub(base)?;
     if len == 0 || within.checked_add(len)? > bytes || offset + (within + len) as u64 > size {
         return None;
     }
-    let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
-    let host = match aliases.get(&section) {
-        Some(a) => a.0,
-        None => {
-            // SAFETY: a section handle the runtime gave; the whole section, to read and write.
-            let host = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_READ | mem::FILE_MAP_WRITE, 0, 0, 0) }.Value as usize;
-            tracing::info!(
-                section = format_args!("{section:#x}"),
-                mb = size >> 20,
-                mapped = host != 0,
-                "a view of our own of a title section, for what shaders wrote to go into title memory through (VICTORY_QUIET_BACK=1)"
-            );
-            aliases.insert(section, (host, size));
-            host
+    // Keep `VIEWS` held while looking up / mapping under `ALIASES` so
+    // `title_memory_section_closed` cannot close or recycle `section` during `MapViewOfFile`.
+    let view = {
+        let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+        match aliases.get(&section) {
+            Some(existing) => Arc::clone(existing),
+            None => {
+                // SAFETY: a section handle the runtime gave; still open while `VIEWS` is held.
+                let host = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_READ | mem::FILE_MAP_WRITE, 0, 0, 0) }.Value as usize;
+                tracing::info!(
+                    section = format_args!("{section:#x}"),
+                    mb = size >> 20,
+                    mapped = host != 0,
+                    "a view of our own of a title section, for what shaders wrote to go into title memory through (VICTORY_QUIET_BACK=1)"
+                );
+                let entry = Arc::new(AliasView { host });
+                aliases.insert(section, Arc::clone(&entry));
+                entry
+            }
         }
     };
-    (host != 0).then(|| (host + offset as usize + within) as *mut u8)
+    drop(v);
+    (view.host != 0).then(|| {
+        let ptr = (view.host + offset as usize + within) as *mut u8;
+        HostAlias { _view: view, ptr }
+    })
 }
 
 /// The address of the 64 KiB page shown at `page` in every title view that
@@ -1325,5 +1358,44 @@ mod tests {
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn host_alias_keeps_view_mapped_across_section_close_and_blocks_post_close_mapping() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        // SAFETY: standalone committed pagefile-backed section for testing.
+        let handle = unsafe {
+            mem::CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                mem::PAGE_READWRITE | mem::SEC_COMMIT,
+                0,
+                K64 as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!handle.is_null());
+        let section = handle as usize;
+        let fake_view = 0x7_9000_0000usize;
+        title_memory_section(section, K64 as u64, true);
+        title_memory_view(fake_view, K64, section, 0);
+
+        let alias = host_alias(fake_view + 64, 16).expect("alias mapped");
+        // Close the section while `alias` is still held by an active writer.
+        title_memory_section_closed(section);
+        // SAFETY: section handle owned by this test; `alias` keeps its mapped view alive.
+        unsafe { CloseHandle(handle) };
+
+        // New lookups must not map the closed handle.
+        assert!(host_alias(fake_view + 64, 16).is_none());
+
+        // Existing `HostAlias` remains mapped and writable until dropped.
+        // SAFETY: `alias` holds an `Arc<AliasView>` covering `[64..80)` of the 64 KiB view.
+        unsafe {
+            std::ptr::write_bytes(alias.as_mut_ptr(), 0x5A, 16);
+            assert_eq!(std::slice::from_raw_parts(alias.as_mut_ptr(), 16), &[0x5A; 16]);
+        }
+        drop(alias);
+        views_gone(fake_view, K64);
     }
 }
