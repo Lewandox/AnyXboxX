@@ -808,6 +808,170 @@ fn store_unaligned_pos(file: *mut c_void, sentinel_kernel_pos: u64, logical_pos:
     UNALIGNED_COUNT.store(map.len(), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Advances or sets `file`'s byte offset to `target`. When `SetFilePointerEx`
+/// rejects a non-sector-aligned offset on a `FILE_FLAG_NO_BUFFERING` handle,
+/// parks the kernel pointer at a sector-aligned sentinel past EOF and records
+/// `target` in [`UNALIGNED_POS`].
+fn set_file_position(file: *mut c_void, target: u64, file_size_hint: Option<u64>) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_BEGIN, GetFileSizeEx};
+    const SECTOR: u64 = 4096;
+    let host_set = host!(
+        "kernel32.dll",
+        "SetFilePointerEx": extern "system" fn(*mut c_void, i64, *mut i64, u32) -> i32
+    );
+    if host_set(file, target as i64, std::ptr::null_mut(), FILE_BEGIN) != 0 {
+        clear_unaligned_pos(file);
+        return true;
+    }
+    let size_u = match file_size_hint {
+        Some(s) => s,
+        None => {
+            let mut file_size = 0i64;
+            // SAFETY: queries size of a caller-supplied handle.
+            if unsafe { GetFileSizeEx(file, &mut file_size) } != 0 && file_size >= 0 {
+                file_size as u64
+            } else {
+                target
+            }
+        }
+    };
+    let sentinel = size_u.max(target).next_multiple_of(SECTOR) + SECTOR;
+    if host_set(file, sentinel as i64, std::ptr::null_mut(), FILE_BEGIN) != 0 {
+        store_unaligned_pos(file, sentinel, target);
+        return true;
+    }
+    false
+}
+
+/// Hooks `SetFilePointerEx` so `FILE_CURRENT` queries and relative seeks on a
+/// `FILE_FLAG_NO_BUFFERING` handle whose kernel pointer was parked at a
+/// sector-aligned sentinel report and advance from the tracked logical offset.
+pub extern "system" fn SetFilePointerEx(
+    file: Handle,
+    distance: i64,
+    new_pos: *mut i64,
+    method: u32,
+) -> i32 {
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_PARAMETER, ERROR_NEGATIVE_SEEK, GetLastError, SetLastError,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_BEGIN, FILE_CURRENT, FILE_END, GetFileSizeEx,
+    };
+    let host_set = host!(
+        "kernel32.dll",
+        "SetFilePointerEx": extern "system" fn(Handle, i64, *mut i64, u32) -> i32
+    );
+    if UNALIGNED_COUNT.load(std::sync::atomic::Ordering::Relaxed) == 0
+        || !has_tracked_unaligned_pos(file)
+    {
+        return host_set(file, distance, new_pos, method);
+    }
+
+    if method == FILE_CURRENT {
+        let Some(cur) = effective_file_position(file) else {
+            return host_set(file, distance, new_pos, method);
+        };
+        let Some(target) = i64::try_from(cur).ok().and_then(|c| c.checked_add(distance)) else {
+            // SAFETY: plain Win32 call.
+            unsafe { SetLastError(ERROR_NEGATIVE_SEEK) };
+            return 0;
+        };
+        if target < 0 {
+            // SAFETY: plain Win32 call.
+            unsafe { SetLastError(ERROR_NEGATIVE_SEEK) };
+            return 0;
+        }
+        if distance != 0 && !set_file_position(file, target as u64, None) {
+            return 0;
+        }
+        if !new_pos.is_null() {
+            // SAFETY: checked non-null above.
+            unsafe { *new_pos = target };
+        }
+        // SAFETY: plain Win32 call.
+        unsafe { SetLastError(0) };
+        return 1;
+    }
+
+    let ok = host_set(file, distance, new_pos, method);
+    if ok != 0 {
+        clear_unaligned_pos(file);
+        return ok;
+    }
+    // SAFETY: plain Win32 call.
+    let err = unsafe { GetLastError() };
+    if err == ERROR_INVALID_PARAMETER && (method == FILE_BEGIN || method == FILE_END) {
+        let mut file_size = 0i64;
+        // SAFETY: queries size of a caller-supplied handle.
+        let has_size = unsafe { GetFileSizeEx(file, &mut file_size) } != 0 && file_size >= 0;
+        let target = if method == FILE_BEGIN {
+            Some(distance)
+        } else if has_size {
+            file_size.checked_add(distance)
+        } else {
+            None
+        };
+        if let Some(target) = target {
+            if target < 0 {
+                // SAFETY: plain Win32 call.
+                unsafe { SetLastError(ERROR_NEGATIVE_SEEK) };
+                return 0;
+            }
+            if set_file_position(file, target as u64, has_size.then_some(file_size as u64)) {
+                if !new_pos.is_null() {
+                    // SAFETY: checked non-null above.
+                    unsafe { *new_pos = target };
+                }
+                // SAFETY: plain Win32 call.
+                unsafe { SetLastError(0) };
+                return 1;
+            }
+        }
+    }
+    // SAFETY: restore original error from host_set.
+    unsafe { SetLastError(err) };
+    0
+}
+
+/// Hooks `SetFilePointer` with the same tracked-offset handling as
+/// [`SetFilePointerEx`].
+pub extern "system" fn SetFilePointer(
+    file: Handle,
+    distance_low: i32,
+    distance_high: *mut i32,
+    method: u32,
+) -> u32 {
+    use windows_sys::Win32::Foundation::SetLastError;
+    const INVALID_SET_FILE_POINTER: u32 = u32::MAX;
+    if UNALIGNED_COUNT.load(std::sync::atomic::Ordering::Relaxed) == 0
+        || !has_tracked_unaligned_pos(file)
+    {
+        return host!(
+            "kernel32.dll",
+            "SetFilePointer": extern "system" fn(Handle, i32, *mut i32, u32) -> u32
+        )(file, distance_low, distance_high, method);
+    }
+    let distance = if distance_high.is_null() {
+        i64::from(distance_low)
+    } else {
+        // SAFETY: checked non-null above.
+        let high = unsafe { *distance_high };
+        (i64::from(high) << 32) | i64::from(distance_low as u32)
+    };
+    let mut new_pos = 0i64;
+    if SetFilePointerEx(file, distance, &mut new_pos, method) == 0 {
+        return INVALID_SET_FILE_POINTER;
+    }
+    if !distance_high.is_null() {
+        // SAFETY: checked non-null above.
+        unsafe { *distance_high = (new_pos >> 32) as i32 };
+    }
+    // SAFETY: required by Win32 SetFilePointer when low 32 bits equal INVALID_SET_FILE_POINTER.
+    unsafe { SetLastError(0) };
+    new_pos as u32
+}
+
 /// Fallback when a synchronous `ReadFile(..., NULL)` fails with
 /// `ERROR_INVALID_PARAMETER` (87):
 /// 1. Handles opened with `FILE_FLAG_OVERLAPPED` reject NULL `OVERLAPPED` on
@@ -828,7 +992,7 @@ fn read_file_sync_fallback(
     read: *mut u32,
 ) -> Option<Result<(), u32>> {
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
-    use windows_sys::Win32::Storage::FileSystem::{FILE_BEGIN, GetFileSizeEx, SetFilePointerEx};
+    use windows_sys::Win32::Storage::FileSystem::GetFileSizeEx;
     use windows_sys::Win32::System::Threading::CreateEventW;
 
     let pos_u = effective_file_position(file)?;
@@ -849,28 +1013,7 @@ fn read_file_sync_fallback(
     match read_at_overlapped(host_read, file, pos_u, buffer, len, event) {
         Ok(got) => {
             let next_pos = pos_u + u64::from(got);
-            // SAFETY: advance file pointer to match synchronous ReadFile semantics.
-            if unsafe { SetFilePointerEx(file, next_pos as i64, std::ptr::null_mut(), FILE_BEGIN) }
-                != 0
-            {
-                clear_unaligned_pos(file);
-            } else {
-                const SECTOR: u64 = 4096;
-                let mut file_size = 0i64;
-                let size_u = if unsafe { GetFileSizeEx(file, &mut file_size) } != 0 && file_size >= 0
-                {
-                    file_size as u64
-                } else {
-                    next_pos
-                };
-                let sentinel = size_u.max(next_pos).next_multiple_of(SECTOR) + SECTOR;
-                if unsafe {
-                    SetFilePointerEx(file, sentinel as i64, std::ptr::null_mut(), FILE_BEGIN)
-                } != 0
-                {
-                    store_unaligned_pos(file, sentinel, next_pos);
-                }
-            }
+            set_file_position(file, next_pos, None);
             if !read.is_null() {
                 // SAFETY: checked non-null above.
                 unsafe { *read = got };
@@ -945,20 +1088,7 @@ fn read_file_sync_fallback(
     }
     let copied_u32 = copied as u32;
     let next_pos = pos_u + copied;
-    // SAFETY: advance file pointer to match synchronous ReadFile semantics.
-    // On `FILE_FLAG_NO_BUFFERING`, `SetFilePointerEx` rejects non-sector-aligned
-    // offsets; park the kernel pointer at a sector-aligned sentinel past EOF
-    // and record `next_pos` so sequential reads continue seamlessly while any
-    // explicit `SetFilePointerEx` by the caller invalidates the cached offset.
-    if unsafe { SetFilePointerEx(file, next_pos as i64, std::ptr::null_mut(), FILE_BEGIN) } != 0 {
-        clear_unaligned_pos(file);
-    } else {
-        let sentinel = file_size_u.max(next_pos).next_multiple_of(SECTOR) + SECTOR;
-        if unsafe { SetFilePointerEx(file, sentinel as i64, std::ptr::null_mut(), FILE_BEGIN) } != 0
-        {
-            store_unaligned_pos(file, sentinel, next_pos);
-        }
-    }
+    set_file_position(file, next_pos, Some(file_size_u));
     if !read.is_null() {
         // SAFETY: checked non-null above.
         unsafe { *read = copied_u32 };
@@ -1135,6 +1265,8 @@ pub(crate) fn module() -> HleModule {
         ],
         exports: vec![
             hle_export!(ReadFile),
+            hle_export!(SetFilePointer),
+            hle_export!(SetFilePointerEx),
             hle_export!(fread),
             hle_export!(CreateFileW),
             hle_export!(CreateFileA),
@@ -1342,6 +1474,60 @@ mod tests {
             );
             assert_eq!(n_rewound, 1500);
             assert_eq!(&rewound[..], &big_payload[..1500]);
+        }
+    }
+
+    #[test]
+    fn unbuffered_bounce_read_reports_logical_position_via_set_file_pointer() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_CURRENT, FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pos.bin");
+        let payload: Vec<u8> = (0..10_000usize).map(|i| ((i * 29 + 11) & 0xff) as u8).collect();
+        std::fs::write(&path, &payload).unwrap();
+
+        for flags in [FILE_FLAG_NO_BUFFERING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED] {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(flags)
+                .open(&path)
+                .unwrap();
+            let handle = file.as_raw_handle().cast();
+
+            let mut buf = vec![0u8; 4784];
+            let mut got = 0u32;
+            assert_ne!(ReadFile(handle, buf.as_mut_ptr(), 4784, &mut got, std::ptr::null_mut()), 0);
+            assert_eq!(got, 4784);
+            assert_eq!(&buf[..], &payload[..4784]);
+
+            // Query logical position via SetFilePointerEx and SetFilePointer.
+            let mut pos = -1i64;
+            assert_ne!(SetFilePointerEx(handle, 0, &mut pos, FILE_CURRENT), 0);
+            assert_eq!(pos, 4784);
+            assert_eq!(SetFilePointer(handle, 0, std::ptr::null_mut(), FILE_CURRENT), 4784);
+
+            // Relative seek backward to an unaligned offset re-parks and reads from 4000.
+            let mut pos2 = -1i64;
+            assert_ne!(SetFilePointerEx(handle, -784, &mut pos2, FILE_CURRENT), 0);
+            assert_eq!(pos2, 4000);
+            let mut slice = [0u8; 128];
+            let mut got2 = 0u32;
+            assert_ne!(
+                ReadFile(handle, slice.as_mut_ptr(), 128, &mut got2, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(got2, 128);
+            assert_eq!(&slice[..], &payload[4000..4128]);
+
+            // Relative seek to a sector-aligned offset (4128 - 32 = 4096) clears the sentinel.
+            let mut pos3 = -1i64;
+            assert_ne!(SetFilePointerEx(handle, -32, &mut pos3, FILE_CURRENT), 0);
+            assert_eq!(pos3, 4096);
+            assert!(!has_tracked_unaligned_pos(handle));
         }
     }
 
