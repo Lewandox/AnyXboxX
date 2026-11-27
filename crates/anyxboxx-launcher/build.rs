@@ -16,15 +16,7 @@ fn git(args: &[&str]) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-fn normalize_version(raw: &str) -> Option<&str> {
-    let trimmed = raw.trim();
-    let stripped = trimmed
-        .strip_prefix("launcher-v")
-        .or_else(|| trimmed.strip_prefix('v'))
-        .unwrap_or(trimmed);
-    (!stripped.is_empty() && stripped.chars().next().is_some_and(|c| c.is_ascii_digit()))
-        .then_some(stripped)
-}
+include!("src/version_norm.rs");
 
 fn launcher_version() -> String {
     if let Ok(explicit) = std::env::var("ANYXBOXX_LAUNCHER_VERSION")
@@ -53,6 +45,7 @@ fn watch(path: &Path) {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/version_norm.rs");
     println!("cargo:rerun-if-env-changed=ANYXBOXX_LAUNCHER_VERSION");
     let version = launcher_version();
     println!("cargo:rustc-env=ANYXBOXX_LAUNCHER_VERSION={version}");
