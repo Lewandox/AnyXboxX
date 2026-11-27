@@ -285,7 +285,7 @@ impl LogLevel {
 pub enum ConsoleProfile {
     #[default]
     SeriesX,
-    /// Xbox Series S: half the memory plan, recommended for 8 GB cards.
+    /// Xbox Series S (`--console series-s`): experimental, unverified on the current base (#338).
     SeriesS,
 }
 
@@ -295,7 +295,7 @@ impl ConsoleProfile {
     pub fn label(self) -> &'static str {
         match self {
             ConsoleProfile::SeriesX => "Xbox Series X",
-            ConsoleProfile::SeriesS => "Xbox Series S (8 GB)",
+            ConsoleProfile::SeriesS => "Xbox Series S (experimental)",
         }
     }
 
@@ -303,7 +303,7 @@ impl ConsoleProfile {
         match self {
             ConsoleProfile::SeriesX => "Full Series X console profile (VIctory's default).",
             ConsoleProfile::SeriesS => {
-                "Series S profile (--console series-s): asks the title for half the memory plan. Recommended for 8 GB cards."
+                "Series S profile (--console series-s): experimental, unverified on the current base (drew UI over a black scene on Neptune, #338)."
             }
         }
     }
