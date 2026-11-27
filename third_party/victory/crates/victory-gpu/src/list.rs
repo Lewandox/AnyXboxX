@@ -410,6 +410,15 @@ fn idle_trim_seconds() -> Option<u64> {
     })
 }
 
+/// Whether idle host-list allocator reclamation, thin backing-list eviction,
+/// pooled `boxed()` reuse, and spike indirect-buffer trimming on reset are
+/// active (`VICTORY_RECLAIM_LISTS=1`; off by default until A/B-measured).
+#[cfg(windows)]
+pub(crate) fn reclaim_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECLAIM_LISTS").is_some_and(|v| v == "1"))
+}
+
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
@@ -467,11 +476,15 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         };
         drop(gone);
     }
-    let cap = idle_cap(
-        crate::residency::limited_host_ram(),
-        crate::residency::pressured(),
-        crate::residency::critical_commit(),
-    );
+    let cap = if reclaim_enabled() {
+        idle_cap(
+            crate::residency::limited_host_ram(),
+            crate::residency::pressured(),
+            crate::residency::critical_commit(),
+        )
+    } else {
+        IDLE_MOST.0
+    };
     if cap == 0 {
         return;
     }
@@ -542,6 +555,9 @@ fn only_the_oldest_idle_lists_are_stale() {
 /// Called once a second by `crate::host::sweep`.
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
+    if !reclaim_enabled() {
+        return;
+    }
     const IDLE_FRAMES: u64 = 4;
     let idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
     let limited = crate::residency::limited_host_ram();
@@ -891,7 +907,13 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: if thin { None } else { fresh_list() },
+        host: if thin {
+            None
+        } else if reclaim_enabled() {
+            fresh_list()
+        } else {
+            crate::host::host().and_then(|h| h.new_list().ok())
+        },
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();

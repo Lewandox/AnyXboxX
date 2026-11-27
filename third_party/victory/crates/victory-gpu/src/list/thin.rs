@@ -306,12 +306,12 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            let cap = backs_cap(
-                crate::residency::pressured(),
-                crate::residency::critical_commit(),
-            );
             let now = crate::host::moment();
-            let dropped = {
+            let dropped = if super::reclaim_enabled() {
+                let cap = backs_cap(
+                    crate::residency::pressured(),
+                    crate::residency::critical_commit(),
+                );
                 let mut backs = held(&BACKS);
                 if backs.len() < cap {
                     backs.push((inner.back, now));
@@ -319,6 +319,9 @@ impl Drop for Recording {
                 } else {
                     inner.back
                 }
+            } else {
+                held(&BACKS).push((inner.back, now));
+                0
             };
             release_back(dropped);
         }
@@ -326,7 +329,9 @@ impl Drop for Recording {
 }
 
 fn give_back(streams: Vec<Vec<u64>>) {
-    let cap = if crate::residency::critical_commit() {
+    let cap = if !super::reclaim_enabled() {
+        WORDS_MOST
+    } else if crate::residency::critical_commit() {
         0
     } else if crate::residency::pressured() {
         WORDS_PRESSURED_MOST

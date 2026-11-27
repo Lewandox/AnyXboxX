@@ -8364,6 +8364,10 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.reset_with_reclaim(crate::list::reclaim_enabled());
+    }
+
+    fn reset_with_reclaim(&self, reclaim: bool) {
         self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -8391,14 +8395,14 @@ impl HostList {
         {
             let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
             states.clear();
-            if states.capacity() > 256 {
+            if reclaim && states.capacity() > 256 {
                 states.shrink_to(64);
             }
         }
         {
             let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
             twins.clear();
-            if twins.capacity() > 256 {
+            if reclaim && twins.capacity() > 256 {
                 twins.shrink_to(64);
             }
         }
@@ -8407,29 +8411,31 @@ impl HostList {
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        // Release spike-grown indirect scratch and overflow batch buffers
-        // outside their mutexes so a single large recording does not pin
-        // oversized device-local UAV buffers across future resets.
-        let extra_batches: Vec<ID3D12Resource> = {
-            let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
-            args.1 = 0;
-            if args.0.len() > 1 {
-                args.0.drain(1..).collect()
-            } else {
-                Vec::new()
-            }
-        };
-        drop(extra_batches);
-        let indirect_limit = indirect_keep_limit(crate::residency::pressured());
-        let oversized_indirect = {
-            let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-            if slot.as_ref().is_some_and(|(_, cap)| *cap > indirect_limit) {
-                slot.take()
-            } else {
-                None
-            }
-        };
-        drop(oversized_indirect);
+        if reclaim {
+            // Release spike-grown indirect scratch and overflow batch buffers
+            // outside their mutexes so a single large recording does not pin
+            // oversized device-local UAV buffers across future resets.
+            let extra_batches: Vec<ID3D12Resource> = {
+                let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+                args.1 = 0;
+                if args.0.len() > 1 {
+                    args.0.drain(1..).collect()
+                } else {
+                    Vec::new()
+                }
+            };
+            drop(extra_batches);
+            let indirect_limit = indirect_keep_limit(crate::residency::pressured());
+            let oversized_indirect = {
+                let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+                if slot.as_ref().is_some_and(|(_, cap)| *cap > indirect_limit) {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            drop(oversized_indirect);
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -13921,6 +13927,46 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     fn indirect_keep_limit_tightens_under_pressure() {
         assert_eq!(super::indirect_keep_limit(false), 1 << 20);
         assert_eq!(super::indirect_keep_limit(true), 256 << 10);
+    }
+
+    #[test]
+    fn host_list_reset_trims_oversized_indirect_buffer_when_reclaim_enabled() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let list = host.new_list().expect("host command list");
+        // Below the keep limit (256 KiB <= 1 MiB): retained across reset even with reclaim on.
+        assert!(list.indirect_scratch(256 << 10).is_some());
+        list.close();
+        list.reset_with_reclaim(true);
+        assert!(
+            list.indirect_args
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some(),
+            "indirect buffer at/below limit should be kept"
+        );
+
+        // Grow past the limit (2 MiB > 1 MiB): kept when reclaim is off, dropped when reclaim is on.
+        assert!(list.indirect_scratch(2 << 20).is_some());
+        list.close();
+        list.reset_with_reclaim(false);
+        assert!(
+            list.indirect_args
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some(),
+            "oversized indirect buffer must stay when reclaim is disabled"
+        );
+        list.close();
+        list.reset_with_reclaim(true);
+        assert!(
+            list.indirect_args
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "oversized indirect buffer must be released on reset when reclaim is enabled"
+        );
     }
 }
 
