@@ -187,9 +187,10 @@ pub(super) fn backs_cap(pressured: bool, critical: bool) -> usize {
 fn release_back(back: usize) {
     if back != 0 {
         // SAFETY: `back` came from `Box::into_raw(super::boxed(...))` in
-        // `back_list`, is closed, and is no longer referenced by any
+        // `back_list` (never passed through `object::hand_out`, so its
+        // `Object::refs` is 0), is closed, and is no longer referenced by any
         // `Recording` or submission.
-        crate::object::release_boxed::<List>(back as This);
+        drop(unsafe { Box::from_raw(back as *mut List) });
     }
 }
 /// Since the last line of the log: streams handed over; calls translated and
@@ -1113,5 +1114,43 @@ mod tests {
         slot[1] = 99;
         assert_eq!((slot[1], kept[1]), (99, 2));
         assert_eq!(record(0), [0; RECORD]);
+    }
+
+    #[test]
+    fn release_back_drops_unreferenced_backing_list() {
+        let raw = Box::into_raw(super::boxed(0, std::ptr::null(), true)) as usize;
+        super::VALUE_WAITS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((
+                raw,
+                super::ValueWait {
+                    address: 0x1000,
+                    comparison: 2,
+                    reference: 1,
+                    wide: false,
+                },
+            ));
+        // Backing lists never pass through `object::hand_out` (`refs == 0`), so
+        // `release_boxed` is a no-op and would leak the allocation.
+        assert_eq!(crate::object::release_boxed::<List>(raw as This), 0);
+        assert!(
+            super::VALUE_WAITS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|&(list, _)| list == raw)
+        );
+
+        release_back(raw);
+        let still_queued = super::VALUE_WAITS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(list, _)| list == raw);
+        assert!(
+            !still_queued,
+            "release_back must drop the unreferenced Box<List> (and purge VALUE_WAITS)"
+        );
     }
 }

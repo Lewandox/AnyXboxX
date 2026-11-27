@@ -136,6 +136,16 @@ struct List {
     thin: thin::Front,
 }
 
+impl Drop for List {
+    fn drop(&mut self) {
+        let addr = std::ptr::from_ref(self) as usize;
+        VALUE_WAITS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&(list, _)| list != addr);
+    }
+}
+
 /// One part of a title list cut at its waits: the waits the queue stands
 /// at, then the host list that runs once they are met.
 #[cfg(windows)]
