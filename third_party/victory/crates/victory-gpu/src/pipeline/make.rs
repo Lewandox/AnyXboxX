@@ -390,6 +390,7 @@ fn wait(p: &Pending, frame: u64) {
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     let _waiter = DoneWaiter::enter();
+    std::sync::atomic::fence(Ordering::SeqCst);
     while p.made.get().is_none() {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
@@ -661,6 +662,10 @@ fn drained() {
 mod tests {
     use super::*;
 
+    /// Serialises tests that observe or drive the process-wide `DONE_WAITERS` /
+    /// `DONE_NOTIFIES` statics so parallel `cargo test` runs cannot interleave.
+    static DONE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
         let failed = Arc::new(Pending::new(Vec::new(), None));
@@ -714,6 +719,7 @@ mod tests {
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
     fn first_use_is_made_by_a_worker() {
+        let _serial = DONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let p = Arc::new(Pending::new(Vec::new(), None));
         assert!(ready(&p).is_none());
         assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
@@ -726,6 +732,7 @@ mod tests {
 
     #[test]
     fn pending_pipeline_is_recorded_for_the_next_launch() {
+        let _serial = DONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut p = Pending::new(Vec::new(), None);
         p.key = "pending-pipeline-test".to_owned();
         // Simulate a worker that has taken the job but cannot finish it yet.
@@ -801,6 +808,7 @@ mod tests {
 
     #[test]
     fn skipped_hash_leaves_pipeline_unqueued_and_unmatched_queues_normally() {
+        let _serial = DONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let shader = |hash: &str| {
             Arc::new(Shader {
                 stage: "compute",
@@ -846,18 +854,38 @@ mod tests {
 
     #[test]
     fn unawaited_make_skips_done_notify_and_awaited_make_wakes_waiter() {
+        let _serial = DONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(DONE_WAITERS.load(Ordering::SeqCst), 0);
+
         let p_bg = Pending::new(Vec::new(), None);
         let before = DONE_NOTIFIES.load(Ordering::Relaxed);
-        if DONE_WAITERS.load(Ordering::SeqCst) == 0 {
-            p_bg.make();
-            assert_eq!(DONE_NOTIFIES.load(Ordering::Relaxed), before);
-        }
+        p_bg.make();
+        assert_eq!(DONE_NOTIFIES.load(Ordering::Relaxed), before);
 
+        // Park a thread in `wait()` on a pending item, then complete it from
+        // this thread and confirm the waiter wakes well before the wait budget.
         let p_waited = Arc::new(Pending::new(Vec::new(), None));
-        let waiter_guard = DoneWaiter::enter();
+        let p_for_waiter = Arc::clone(&p_waited);
+        let waiter = std::thread::spawn(move || {
+            let began = Instant::now();
+            wait(&p_for_waiter, u64::MAX - 1);
+            began.elapsed()
+        });
+        let spin_start = Instant::now();
+        while DONE_WAITERS.load(Ordering::SeqCst) == 0 {
+            assert!(spin_start.elapsed() < Duration::from_secs(2), "waiter did not enter wait()");
+            std::thread::yield_now();
+        }
+        // Let the waiter enter `condvar::wait_timeout` before notifying.
+        std::thread::sleep(Duration::from_millis(20));
         let before_waited = DONE_NOTIFIES.load(Ordering::Relaxed);
         p_waited.make();
+        let waited = waiter.join().expect("waiter thread panicked");
         assert!(DONE_NOTIFIES.load(Ordering::Relaxed) > before_waited);
-        drop(waiter_guard);
+        assert!(p_waited.made.get().is_some());
+        assert!(
+            waited < Duration::from_millis(250),
+            "waiter was not woken promptly by make(): waited {waited:?}"
+        );
     }
 }
