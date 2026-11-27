@@ -537,6 +537,33 @@ pub extern "system" fn ReadFile(
 ) -> i32 {
     let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
     let host_read = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32);
+    // If an earlier unaligned bounce read on a `FILE_FLAG_NO_BUFFERING` handle
+    // left a tracked non-sector-aligned logical position (with the kernel file
+    // pointer parked at a sector-aligned sentinel), serve synchronous reads on
+    // that handle from the tracked logical offset even when `buffer` and `len`
+    // happen to be sector-aligned.
+    if overlapped.is_null()
+        && !buffer.is_null()
+        && len > 0
+        && UNALIGNED_COUNT.load(std::sync::atomic::Ordering::Relaxed) > 0
+        && has_tracked_unaligned_pos(file)
+        && let Some(result) = read_file_sync_fallback(host_read, file, buffer, len, read)
+    {
+        drop(writing);
+        return match result {
+            Ok(()) => {
+                // SAFETY: plain Win32 call.
+                unsafe { windows_sys::Win32::Foundation::SetLastError(0) };
+                1
+            }
+            Err(e) => {
+                // SAFETY: plain Win32 call.
+                unsafe { windows_sys::Win32::Foundation::SetLastError(e) };
+                0
+            }
+        };
+    }
+
     let mut done = host_read(file, buffer, len, read, overlapped);
     // The call's error is the title's to ask for.
     // SAFETY: plain calls.
@@ -545,7 +572,6 @@ pub extern "system" fn ReadFile(
         && error == windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER
         && overlapped.is_null()
         && !buffer.is_null()
-        && !read.is_null()
         && len > 0
         && let Some(result) = read_file_sync_fallback(host_read, file, buffer, len, read)
     {
@@ -680,6 +706,108 @@ fn query_file_position(file: *mut c_void) -> Option<u64> {
     (status >= 0 && pos >= 0).then_some(pos as u64)
 }
 
+/// Non-sector-aligned logical byte offset tracked for a `FILE_FLAG_NO_BUFFERING`
+/// handle after an unaligned synchronous bounce read. Because Windows forbids
+/// setting `CurrentByteOffset` to a non-sector-aligned value on unbuffered
+/// handles, we park the kernel `CurrentByteOffset` at a sector-aligned sentinel
+/// past EOF; if the caller later seeks the handle (changing `CurrentByteOffset`
+/// away from `sentinel_kernel_pos`) or closes and reuses the handle value for
+/// another file (`identity` mismatch), the entry automatically invalidates.
+#[derive(Clone, Copy)]
+struct UnalignedPos {
+    identity: (u32, u32, u32),
+    sentinel_kernel_pos: u64,
+    logical_pos: u64,
+}
+
+static UNALIGNED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static UNALIGNED_POS: std::sync::Mutex<Option<std::collections::HashMap<usize, UnalignedPos>>> =
+    std::sync::Mutex::new(None);
+
+fn file_identity(file: *mut c_void) -> Option<(u32, u32, u32)> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    // SAFETY: zero-initialized Win32 struct populated by GetFileInformationByHandle.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: queries metadata on a caller-supplied handle (fails cleanly if invalid).
+    (unsafe { GetFileInformationByHandle(file, &mut info) } != 0).then_some((
+        info.dwVolumeSerialNumber,
+        info.nFileIndexHigh,
+        info.nFileIndexLow,
+    ))
+}
+
+fn has_tracked_unaligned_pos(file: *mut c_void) -> bool {
+    let Some(kernel_pos) = query_file_position(file) else {
+        return false;
+    };
+    let id = file_identity(file);
+    let mut guard = UNALIGNED_POS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = guard.as_mut() else {
+        return false;
+    };
+    if let Some(&entry) = map.get(&(file as usize)) {
+        if entry.sentinel_kernel_pos == kernel_pos && id == Some(entry.identity) {
+            return true;
+        }
+        map.remove(&(file as usize));
+        UNALIGNED_COUNT.store(map.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+    false
+}
+
+fn effective_file_position(file: *mut c_void) -> Option<u64> {
+    let kernel_pos = query_file_position(file)?;
+    if UNALIGNED_COUNT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return Some(kernel_pos);
+    }
+    let id = file_identity(file);
+    let mut guard = UNALIGNED_POS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut()
+        && let Some(&entry) = map.get(&(file as usize))
+    {
+        if entry.sentinel_kernel_pos == kernel_pos && id == Some(entry.identity) {
+            return Some(entry.logical_pos);
+        }
+        map.remove(&(file as usize));
+        UNALIGNED_COUNT.store(map.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+    Some(kernel_pos)
+}
+
+fn clear_unaligned_pos(file: *mut c_void) {
+    if UNALIGNED_COUNT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut guard = UNALIGNED_POS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut()
+        && map.remove(&(file as usize)).is_some()
+    {
+        UNALIGNED_COUNT.store(map.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn store_unaligned_pos(file: *mut c_void, sentinel_kernel_pos: u64, logical_pos: u64) {
+    let Some(identity) = file_identity(file) else {
+        return;
+    };
+    let mut guard = UNALIGNED_POS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    if map.len() >= 1024 && !map.contains_key(&(file as usize)) {
+        map.clear();
+    }
+    map.insert(
+        file as usize,
+        UnalignedPos {
+            identity,
+            sentinel_kernel_pos,
+            logical_pos,
+        },
+    );
+    UNALIGNED_COUNT.store(map.len(), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Fallback when a synchronous `ReadFile(..., NULL)` fails with
 /// `ERROR_INVALID_PARAMETER` (87):
 /// 1. Handles opened with `FILE_FLAG_OVERLAPPED` reject NULL `OVERLAPPED` on
@@ -703,7 +831,7 @@ fn read_file_sync_fallback(
     use windows_sys::Win32::Storage::FileSystem::{FILE_BEGIN, GetFileSizeEx, SetFilePointerEx};
     use windows_sys::Win32::System::Threading::CreateEventW;
 
-    let pos_u = query_file_position(file)?;
+    let pos_u = effective_file_position(file)?;
     // SAFETY: creates a private manual-reset event closed before return.
     let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
     if event.is_null() {
@@ -720,10 +848,33 @@ fn read_file_sync_fallback(
 
     match read_at_overlapped(host_read, file, pos_u, buffer, len, event) {
         Ok(got) => {
+            let next_pos = pos_u + u64::from(got);
             // SAFETY: advance file pointer to match synchronous ReadFile semantics.
-            unsafe { SetFilePointerEx(file, (pos_u + u64::from(got)) as i64, std::ptr::null_mut(), FILE_BEGIN) };
-            // SAFETY: caller verified `read` is non-null.
-            unsafe { *read = got };
+            if unsafe { SetFilePointerEx(file, next_pos as i64, std::ptr::null_mut(), FILE_BEGIN) }
+                != 0
+            {
+                clear_unaligned_pos(file);
+            } else {
+                const SECTOR: u64 = 4096;
+                let mut file_size = 0i64;
+                let size_u = if unsafe { GetFileSizeEx(file, &mut file_size) } != 0 && file_size >= 0
+                {
+                    file_size as u64
+                } else {
+                    next_pos
+                };
+                let sentinel = size_u.max(next_pos).next_multiple_of(SECTOR) + SECTOR;
+                if unsafe {
+                    SetFilePointerEx(file, sentinel as i64, std::ptr::null_mut(), FILE_BEGIN)
+                } != 0
+                {
+                    store_unaligned_pos(file, sentinel, next_pos);
+                }
+            }
+            if !read.is_null() {
+                // SAFETY: checked non-null above.
+                unsafe { *read = got };
+            }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 tracing::info!(
@@ -747,8 +898,10 @@ fn read_file_sync_fallback(
     }
     let file_size_u = file_size as u64;
     if pos_u >= file_size_u {
-        // SAFETY: caller verified `read` is non-null.
-        unsafe { *read = 0 };
+        if !read.is_null() {
+            // SAFETY: checked non-null above.
+            unsafe { *read = 0 };
+        }
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             tracing::info!(
@@ -794,17 +947,22 @@ fn read_file_sync_fallback(
     let next_pos = pos_u + copied;
     // SAFETY: advance file pointer to match synchronous ReadFile semantics.
     // On `FILE_FLAG_NO_BUFFERING`, `SetFilePointerEx` rejects non-sector-aligned
-    // offsets; if we reached EOF, advance to the next sector boundary so
-    // subsequent top-up reads observe `pos >= file_size` and return 0 bytes.
-    if unsafe { SetFilePointerEx(file, next_pos as i64, std::ptr::null_mut(), FILE_BEGIN) } == 0
-        && next_pos >= file_size_u
-    {
-        let eof_aligned = file_size_u.next_multiple_of(SECTOR);
-        // SAFETY: sector-aligned seek at/past EOF on a valid file handle.
-        unsafe { SetFilePointerEx(file, eof_aligned as i64, std::ptr::null_mut(), FILE_BEGIN) };
+    // offsets; park the kernel pointer at a sector-aligned sentinel past EOF
+    // and record `next_pos` so sequential reads continue seamlessly while any
+    // explicit `SetFilePointerEx` by the caller invalidates the cached offset.
+    if unsafe { SetFilePointerEx(file, next_pos as i64, std::ptr::null_mut(), FILE_BEGIN) } != 0 {
+        clear_unaligned_pos(file);
+    } else {
+        let sentinel = file_size_u.max(next_pos).next_multiple_of(SECTOR) + SECTOR;
+        if unsafe { SetFilePointerEx(file, sentinel as i64, std::ptr::null_mut(), FILE_BEGIN) } != 0
+        {
+            store_unaligned_pos(file, sentinel, next_pos);
+        }
     }
-    // SAFETY: caller verified `read` is non-null.
-    unsafe { *read = copied_u32 };
+    if !read.is_null() {
+        // SAFETY: checked non-null above.
+        unsafe { *read = copied_u32 };
+    }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         tracing::info!(
@@ -1069,6 +1227,16 @@ mod tests {
         let (mut c, mut n3) = ([0u8; 8], 99);
         assert_ne!(ReadFile(handle, c.as_mut_ptr(), 8, &mut n3, std::ptr::null_mut()), 0);
         assert_eq!(n3, 0);
+
+        // Synchronous read with NULL `lpNumberOfBytesRead` also succeeds.
+        use windows_sys::Win32::Storage::FileSystem::{FILE_BEGIN, SetFilePointerEx};
+        assert_ne!(unsafe { SetFilePointerEx(handle, 0, std::ptr::null_mut(), FILE_BEGIN) }, 0);
+        let mut d = [0u8; 5];
+        assert_ne!(
+            ReadFile(handle, d.as_mut_ptr(), 5, std::ptr::null_mut(), std::ptr::null_mut()),
+            0
+        );
+        assert_eq!(&d, b"hello");
     }
 
     #[test]
@@ -1076,7 +1244,7 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED,
+            FILE_BEGIN, FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, SetFilePointerEx,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -1084,6 +1252,10 @@ mod tests {
         // Exact #488 size: 4784 bytes (first 8192 read gets 4784, top-up of 3408 used to fail with 87).
         let payload: Vec<u8> = (0..4784usize).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
         std::fs::write(&path, &payload).unwrap();
+
+        let big_path = dir.path().join("unbuf_big.bin");
+        let big_payload: Vec<u8> = (0..10_000usize).map(|i| ((i * 17 + 3) & 0xff) as u8).collect();
+        std::fs::write(&big_path, &big_payload).unwrap();
 
         for flags in [FILE_FLAG_NO_BUFFERING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED] {
             let file = std::fs::OpenOptions::new()
@@ -1117,7 +1289,7 @@ mod tests {
             );
             assert_eq!(got2, 0);
 
-            // Unaligned read from a sector-aligned offset (0 -> 3408 bytes) succeeds via 4 KiB bounce.
+            // Sequential unaligned reads (0..3408, then 3408..4784, then EOF).
             let file2 = std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(flags)
@@ -1129,6 +1301,47 @@ mod tests {
             assert_ne!(ReadFile(h2, slice.as_mut_ptr(), 3408, &mut n_slice, std::ptr::null_mut()), 0);
             assert_eq!(n_slice, 3408);
             assert_eq!(&slice[..], &payload[..3408]);
+
+            let mut tail = vec![0u8; 2000];
+            let mut n_tail = 0u32;
+            assert_ne!(ReadFile(h2, tail.as_mut_ptr(), 2000, &mut n_tail, std::ptr::null_mut()), 0);
+            assert_eq!(n_tail, 1376);
+            assert_eq!(&tail[..1376], &payload[3408..]);
+
+            let mut eof_n = 99u32;
+            assert_ne!(ReadFile(h2, tail.as_mut_ptr(), 64, &mut eof_n, std::ptr::null_mut()), 0);
+            assert_eq!(eof_n, 0);
+
+            // Unaligned read followed by a 4 KiB-aligned read AND explicit SetFilePointerEx rewind.
+            let file3 = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(flags)
+                .open(&big_path)
+                .unwrap();
+            let h3 = file3.as_raw_handle().cast();
+            let mut head = vec![0u8; 1500];
+            let mut n_head = 0u32;
+            assert_ne!(ReadFile(h3, head.as_mut_ptr(), 1500, &mut n_head, std::ptr::null_mut()), 0);
+            assert_eq!(n_head, 1500);
+            assert_eq!(&head[..], &big_payload[..1500]);
+
+            let aligned = AlignedBuf::new(4096, 4096).unwrap();
+            let mut n_aligned = 0u32;
+            assert_ne!(ReadFile(h3, aligned.ptr, 4096, &mut n_aligned, std::ptr::null_mut()), 0);
+            assert_eq!(n_aligned, 4096);
+            let aligned_slice = unsafe { std::slice::from_raw_parts(aligned.ptr, 4096) };
+            assert_eq!(aligned_slice, &big_payload[1500..5596]);
+
+            // Rewinding to 0 invalidates the tracked unaligned position cleanly.
+            assert_ne!(unsafe { SetFilePointerEx(h3, 0, std::ptr::null_mut(), FILE_BEGIN) }, 0);
+            let mut rewound = vec![0u8; 1500];
+            let mut n_rewound = 0u32;
+            assert_ne!(
+                ReadFile(h3, rewound.as_mut_ptr(), 1500, &mut n_rewound, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(n_rewound, 1500);
+            assert_eq!(&rewound[..], &big_payload[..1500]);
         }
     }
 
