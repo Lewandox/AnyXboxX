@@ -1708,13 +1708,35 @@ static MADE_LATE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new(
 #[cfg(windows)]
 static MADE_LATE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(windows)]
+fn push_made_late(
+    list: &std::sync::Mutex<Vec<usize>>,
+    pending: &std::sync::atomic::AtomicBool,
+    resource: usize,
+) {
+    let mut made = list.lock().unwrap_or_else(|e| e.into_inner());
+    made.push(resource);
+    pending.store(true, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(windows)]
+fn take_made_late(
+    list: &std::sync::Mutex<Vec<usize>>,
+    pending: &std::sync::atomic::AtomicBool,
+) -> Vec<usize> {
+    if !pending.load(std::sync::atomic::Ordering::Acquire) {
+        return Vec::new();
+    }
+    let mut guard = list.lock().unwrap_or_else(|e| e.into_inner());
+    pending.store(false, std::sync::atomic::Ordering::Release);
+    std::mem::take(&mut *guard)
+}
+
 /// Title texture `resource` was given its host copy (called under that
 /// texture's own lock: nothing else is locked here).
 #[cfg(windows)]
 pub(crate) fn texture_made(resource: usize) {
-    let mut made = MADE_LATE.lock().unwrap_or_else(|e| e.into_inner());
-    made.push(resource);
-    MADE_LATE_PENDING.store(true, std::sync::atomic::Ordering::Release);
+    push_made_late(&MADE_LATE, &MADE_LATE_PENDING, resource);
 }
 
 #[cfg(windows)]
@@ -1863,14 +1885,7 @@ pub(crate) fn unpark_seen(seen: &[u32]) -> u64 {
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
-    if !MADE_LATE_PENDING.load(std::sync::atomic::Ordering::Acquire) {
-        return;
-    }
-    let made = {
-        let mut guard = MADE_LATE.lock().unwrap_or_else(|e| e.into_inner());
-        MADE_LATE_PENDING.store(false, std::sync::atomic::Ordering::Release);
-        std::mem::take(&mut *guard)
-    };
+    let made = take_made_late(&MADE_LATE, &MADE_LATE_PENDING);
     if made.is_empty() {
         return;
     }
@@ -2933,10 +2948,17 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn make_waiting_clears_pending_flag_when_drained() {
-        texture_made(0xDEAD_BEEF);
-        assert!(MADE_LATE_PENDING.load(std::sync::atomic::Ordering::Acquire));
-        make_waiting();
-        assert!(!MADE_LATE_PENDING.load(std::sync::atomic::Ordering::Acquire));
+    fn take_made_late_fast_paths_when_clear_and_clears_pending_when_drained() {
+        let list = std::sync::Mutex::new(vec![0x1111usize]);
+        let pending = std::sync::atomic::AtomicBool::new(false);
+        // Fast path skips the mutex when `pending` is false.
+        assert!(take_made_late(&list, &pending).is_empty());
+        assert_eq!(list.lock().unwrap().len(), 1);
+
+        push_made_late(&list, &pending, 0x2222);
+        assert!(pending.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(take_made_late(&list, &pending), vec![0x1111, 0x2222]);
+        assert!(!pending.load(std::sync::atomic::Ordering::Acquire));
+        assert!(take_made_late(&list, &pending).is_empty());
     }
 }
