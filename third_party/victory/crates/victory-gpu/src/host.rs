@@ -584,6 +584,7 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    crate::list::let_go_idle();
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -2034,6 +2035,14 @@ pub(crate) fn closed_for_execution(runs: &[&HostList]) -> usize {
         }
     }
     found
+}
+
+/// Maximum per-list indirect scratch buffer capacity retained across resets.
+/// Larger spike buffers are released on [`HostList::reset`] so a single large
+/// indirect execution does not permanently pin multi-MiB UAV memory on a
+/// recycled list.
+fn indirect_keep_limit(pressured: bool) -> u64 {
+    if pressured { 256 << 10 } else { 1 << 20 }
 }
 
 /// A host command list and its allocator, always used together.
@@ -8379,13 +8388,48 @@ impl HostList {
             deferred.constant_write_version = constant_write_version;
             texture_backs
         };
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            states.clear();
+            if states.capacity() > 256 {
+                states.shrink_to(64);
+            }
+        }
+        {
+            let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+            twins.clear();
+            if twins.capacity() > 256 {
+                twins.shrink_to(64);
+            }
+        }
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // Release spike-grown indirect scratch and overflow batch buffers
+        // outside their mutexes so a single large recording does not pin
+        // oversized device-local UAV buffers across future resets.
+        let extra_batches: Vec<ID3D12Resource> = {
+            let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+            args.1 = 0;
+            if args.0.len() > 1 {
+                args.0.drain(1..).collect()
+            } else {
+                Vec::new()
+            }
+        };
+        drop(extra_batches);
+        let indirect_limit = indirect_keep_limit(crate::residency::pressured());
+        let oversized_indirect = {
+            let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().is_some_and(|(_, cap)| *cap > indirect_limit) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        drop(oversized_indirect);
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -13871,6 +13915,12 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn indirect_keep_limit_tightens_under_pressure() {
+        assert_eq!(super::indirect_keep_limit(false), 1 << 20);
+        assert_eq!(super::indirect_keep_limit(true), 256 << 10);
     }
 }
 
