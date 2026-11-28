@@ -85,6 +85,14 @@ def test_put_accepts_identical_peer_entry_on_persistent_lock_else_raises(tmp_pat
     cache.put(key, DXIL)
     assert list(tmp_path.glob("*/*.tmp")) == []
 
+    # Existing destination with different bytes raises PermissionError, preserves
+    # the existing peer bytes, and leaves no orphan .tmp.
+    other_dxil = b"DXBC" + bytes([1] * 60)
+    with pytest.raises(PermissionError):
+        cache.put(key, other_dxil)
+    assert next(tmp_path.glob("*/*.dxil")).read_bytes() == DXIL
+    assert list(tmp_path.glob("*/*.tmp")) == []
+
     # Missing destination still raises PermissionError and leaves no orphan .tmp.
     missing_key = shader_cache.cache_key("missing", "cs_6_0", None)
     with pytest.raises(PermissionError):
